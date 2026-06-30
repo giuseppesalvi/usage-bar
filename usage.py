@@ -614,7 +614,8 @@ def _blit(out: bytearray, W: int, H: int, text: str, cx: float, cy: float,
 
 
 def _ring_rgba(pct: float, rgb: tuple[float, float, float], size: int, ss: int = 3,
-               top: str | None = None, bottom: str | None = None) -> bytearray:
+               top: str | None = None, bottom: str | None = None,
+               center: str | None = None) -> bytearray:
     """One square ring gauge (size×size RGBA): faint track + colored arc, AA'd
     by ss×ss supersampling. Arc starts at 12 o'clock, fills clockwise. Optional
     `top`/`bottom` text are baked in the threshold color (e.g. tag + percent)."""
@@ -655,6 +656,10 @@ def _ring_rgba(pct: float, rgb: tuple[float, float, float], size: int, ss: int =
                 out[i + 2] = int(sb / sa * 255)
                 out[i + 3] = int(sa / n * 255)
     fs = max(1, size // 22)
+    if center:
+        # 1–2 digit % gets a bigger font; 3-digit "100" stays small so it fits.
+        cscale = fs + 1 if len(center) <= 2 else fs
+        _blit(out, size, size, center, size / 2, size / 2, cscale, rgb)
     if top:
         _blit(out, size, size, top, size / 2, size * 0.35, fs, rgb)
     if bottom:
@@ -676,20 +681,43 @@ def _compose_h(layers: list[bytearray], size: int, gap: int = 2) -> tuple[int, i
     return w, size, bytes(out)
 
 
-def gauges_image(items: list[dict], size: int = 26) -> str | None:
-    """Base64 PNG: a row of ring gauges, each baked with a tag + percent.
+def _gauge_cell(tag: str, pct: float, ring: int = 26, label_scale: int = 2) -> tuple[int, int, bytearray]:
+    """One gauge: a name letter to the left, a ring with the % centered inside."""
+    rgb = _hex_rgb(_pct_color(pct))
+    ring_buf = _ring_rgba(pct, rgb, ring, center=f"{pct:.0f}")
+    label_w = 3 * label_scale
+    gap = 2
+    w = label_w + gap + ring
+    h = ring
+    cell = bytearray(w * h * 4)
+    _blit(cell, w, h, tag, label_w / 2, h / 2, label_scale, rgb)  # name, left, centered
+    x0 = label_w + gap
+    for y in range(ring):  # paste ring on the right
+        src = y * ring * 4
+        dst = (y * w + x0) * 4
+        cell[dst:dst + ring * 4] = ring_buf[src:src + ring * 4]
+    return w, h, cell
+
+
+def gauges_image(items: list[dict], ring: int = 26) -> str | None:
+    """Base64 PNG: a row of "<name> (ring with % inside)" gauges.
     items: [{"tag": "C", "pct": 73.0}, ...]"""
-    layers = []
-    for it in items:
-        pct = it["pct"]
-        layers.append(_ring_rgba(
-            pct, _hex_rgb(_pct_color(pct)), size,
-            top=it.get("tag"), bottom=f"{pct:.0f}",
-        ))
-    if not layers:
+    cells = [_gauge_cell(it["tag"], it["pct"], ring) for it in items]
+    if not cells:
         return None
-    w, h, rgba = _compose_h(layers, size, gap=3)
-    return base64.b64encode(_png_bytes(w, h, rgba)).decode("ascii")
+    gap = 6
+    h = max(c[1] for c in cells)
+    w = sum(c[0] for c in cells) + gap * (len(cells) - 1)
+    out = bytearray(w * h * 4)
+    x = 0
+    for cw, ch, cbuf in cells:
+        yoff = (h - ch) // 2
+        for y in range(ch):
+            src = y * cw * 4
+            dst = ((y + yoff) * w + x) * 4
+            out[dst:dst + cw * 4] = cbuf[src:src + cw * 4]
+        x += cw + gap
+    return base64.b64encode(_png_bytes(w, h, out)).decode("ascii")
 
 
 # window key → (codex field, claude field, minutes, bar label)
