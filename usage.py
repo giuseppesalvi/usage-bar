@@ -623,7 +623,7 @@ def _ring_rgba(pct: float, rgb: tuple[float, float, float], size: int, ss: int =
     sw = sh = size * ss
     cx = cy = sw / 2.0
     r_out = sw * 0.46
-    r_in = r_out - sw * 0.17
+    r_in = r_out - sw * 0.10  # thin Apple-style stroke
     track = (0.55, 0.55, 0.58)
     track_a = 0.34
     out = bytearray(size * size * 4)
@@ -657,9 +657,7 @@ def _ring_rgba(pct: float, rgb: tuple[float, float, float], size: int, ss: int =
                 out[i + 3] = int(sa / n * 255)
     fs = max(1, size // 22)
     if center:
-        # 1–2 digit % gets a bigger font; 3-digit "100" stays small so it fits.
-        cscale = fs + 1 if len(center) <= 2 else fs
-        _blit(out, size, size, center, size / 2, size / 2, cscale, rgb)
+        _blit(out, size, size, center, size / 2, size / 2, fs, rgb)  # lightest weight
     if top:
         _blit(out, size, size, top, size / 2, size * 0.35, fs, rgb)
     if bottom:
