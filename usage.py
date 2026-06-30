@@ -111,6 +111,77 @@ def set_claude_enabled(on: bool) -> None:
     _save_config(cfg)
 
 
+# ── Display customization (editable live from the dropdown) ──
+DISPLAY_DEFAULTS = {
+    "style": "ring",                 # ring | harvey | text
+    "tools": ["codex", "claude"],    # which tools appear in the menu bar
+    "windows": ["5h"],               # which windows in the bar: 5h and/or weekly
+    "show_spend": True,
+    "spend_range": "today",          # today | d7 | d30
+}
+_DISPLAY_CHOICES = {
+    "style": ["ring", "harvey", "text"],
+    "spend_range": ["today", "d7", "d30"],
+}
+_DISPLAY_LISTS = {"tools": ["codex", "claude"], "windows": ["5h", "weekly"]}
+
+
+def display_cfg() -> dict:
+    cfg = {**DISPLAY_DEFAULTS, **_load_config().get("display", {})}
+    return cfg
+
+
+def set_display(key: str, value) -> None:
+    cfg = _load_config()
+    cfg.setdefault("display", {})[key] = value
+    _save_config(cfg)
+
+
+def cycle_display(key: str) -> None:
+    """Advance a scalar setting to its next allowed value."""
+    choices = _DISPLAY_CHOICES.get(key)
+    if not choices:
+        return
+    cur = display_cfg().get(key)
+    nxt = choices[(choices.index(cur) + 1) % len(choices)] if cur in choices else choices[0]
+    set_display(key, nxt)
+
+
+def toggle_display_list(key: str, item: str) -> None:
+    """Add/remove an item from a list setting (tools, windows)."""
+    if key not in _DISPLAY_LISTS or item not in _DISPLAY_LISTS[key]:
+        return
+    cur = list(display_cfg().get(key, []))
+    if item in cur:
+        cur.remove(item)
+    else:
+        # preserve canonical order
+        cur = [x for x in _DISPLAY_LISTS[key] if x in cur or x == item]
+    set_display(key, cur)
+
+
+def toggle_display_bool(key: str) -> None:
+    set_display(key, not bool(display_cfg().get(key)))
+
+
+_WINDOW_MINUTES = {"5h": 300, "weekly": 10080, "five_hour": 300, "seven_day": 10080}
+
+
+def _project(used_percent, window_minutes, resets_at) -> dict | None:
+    """Project a window's end-of-period % and ETA-to-cap from current burn,
+    assuming the average rate so far this window holds. No persistence needed."""
+    if used_percent is None or not window_minutes or not resets_at:
+        return None
+    remaining = (resets_at - time.time()) / 60
+    elapsed = window_minutes - remaining
+    if elapsed <= 1 or used_percent <= 0 or remaining <= 0:
+        return None
+    rate = used_percent / elapsed  # %/min
+    proj = used_percent + rate * remaining
+    eta_min = (100 - used_percent) / rate if rate > 0 else None
+    return {"proj": proj, "eta_min": eta_min if eta_min and eta_min < remaining else None}
+
+
 def _claude_token() -> str | None:
     """Reuse the OAuth token Claude Code stored (file first, then Keychain)."""
     p = HOME / ".claude" / ".credentials.json"
@@ -204,20 +275,34 @@ def _ts_to_local_date(ts: str) -> str | None:
         return None
 
 
-def claude_today() -> dict:
-    """Sum today's Claude token usage and price it. Returns {} on no data."""
-    today = _local_today()
-    # One assistant response can be written as many JSONL lines that share
-    # (message.id, requestId): multiple content blocks repeat the usage, and
-    # streaming snapshots grow output_tokens 2 -> 2 -> N. It's also copied
-    # verbatim across files on resume/branch. So collapse to one record per key
-    # and keep the line with the MAX output (the final cumulative snapshot) —
-    # first-wins would keep a partial and undercount; summing would over-count.
-    best: dict[tuple, dict] = {}  # (mid, rid) -> {model, fields...}
-    unkeyed: list[dict] = []      # lines with no id at all -> can't dedup, keep each
+def _price(a: dict) -> float:
+    in_rate, out_rate = rate_for(a["model"])
+    return (
+        a["input"] * in_rate
+        + a["output"] * out_rate
+        + a["cache_read"] * in_rate * 0.1
+        + a["cw_5m"] * in_rate * 1.25
+        + a["cw_1h"] * in_rate * 2.0
+    ) / 1_000_000
+
+
+def claude_spend() -> dict:
+    """Price Claude token usage over today / last 7d / last 30d, with today's
+    per-model breakdown. Dedup: one record per (message.id, requestId), keeping
+    the max-output line (streaming snapshots grow output; resumes copy lines)."""
+    from datetime import timedelta
+
+    now = datetime.now().astimezone()
+    today = now.strftime("%Y-%m-%d")
+    d7 = {(now - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)}
+    d30 = {(now - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(30)}
+
+    best: dict[tuple, dict] = {}
+    unkeyed: list[dict] = []
     dup_count = 0
     if not CLAUDE_PROJECTS.exists():
-        return {"cost": 0.0, "models": {}, "found": False}
+        return {"found": False, "cost": 0.0, "models": {},
+                "spend": {"today": 0.0, "d7": 0.0, "d30": 0.0}}
 
     for jf in CLAUDE_PROJECTS.rglob("*.jsonl"):
         try:
@@ -235,15 +320,15 @@ def claude_today() -> dict:
                     usage = msg.get("usage")
                     if not isinstance(usage, dict):
                         continue
-                    ts = rec.get("timestamp")
-                    if not ts or _ts_to_local_date(ts) != today:
+                    date = _ts_to_local_date(rec.get("timestamp") or "")
+                    if not date or date not in d30:
                         continue
                     cc = usage.get("cache_creation") or {}
                     cw_5m = cc.get("ephemeral_5m_input_tokens", 0) or 0
                     cw_1h = cc.get("ephemeral_1h_input_tokens", 0) or 0
                     cc_total = usage.get("cache_creation_input_tokens", 0) or 0
                     if cw_5m + cw_1h == 0 and cc_total:
-                        cw_5m = cc_total  # no breakdown -> assume 5m
+                        cw_5m = cc_total
                     rec_fields = {
                         "model": msg.get("model") or "unknown",
                         "input": usage.get("input_tokens", 0) or 0,
@@ -251,6 +336,7 @@ def claude_today() -> dict:
                         "cache_read": usage.get("cache_read_input_tokens", 0) or 0,
                         "cw_5m": cw_5m,
                         "cw_1h": cw_1h,
+                        "date": date,
                     }
                     mid = msg.get("id")
                     rid = rec.get("requestId")
@@ -268,29 +354,29 @@ def claude_today() -> dict:
         except OSError:
             continue
 
+    s_today = s7 = s30 = 0.0
     by_model: dict[str, dict] = {}
-    for rec_fields in list(best.values()) + unkeyed:
-        acc = by_model.setdefault(
-            rec_fields["model"],
-            {"input": 0, "output": 0, "cache_read": 0, "cw_5m": 0, "cw_1h": 0},
-        )
-        for f in ("input", "output", "cache_read", "cw_5m", "cw_1h"):
-            acc[f] += rec_fields[f]
+    for rf in list(best.values()) + unkeyed:
+        c = _price(rf)
+        s30 += c
+        if rf["date"] in d7:
+            s7 += c
+        if rf["date"] == today:
+            s_today += c
+            acc = by_model.setdefault(
+                rf["model"], {"input": 0, "output": 0, "cache_read": 0, "cw_5m": 0, "cw_1h": 0}
+            )
+            for f in ("input", "output", "cache_read", "cw_5m", "cw_1h"):
+                acc[f] += rf[f]
 
-    total = 0.0
-    priced = {}
-    for model, a in by_model.items():
-        in_rate, out_rate = rate_for(model)
-        cost = (
-            a["input"] * in_rate
-            + a["output"] * out_rate
-            + a["cache_read"] * in_rate * 0.1
-            + a["cw_5m"] * in_rate * 1.25
-            + a["cw_1h"] * in_rate * 2.0
-        ) / 1_000_000
-        total += cost
-        priced[model] = {**a, "cost": cost}
-    return {"cost": total, "models": priced, "found": bool(by_model), "dups_skipped": dup_count}
+    priced = {m: {**a, "cost": _price({**a, "model": m})} for m, a in by_model.items()}
+    return {
+        "found": s30 > 0,
+        "cost": s_today,
+        "models": priced,
+        "dups_skipped": dup_count,
+        "spend": {"today": s_today, "d7": s7, "d30": s30},
+    }
 
 
 def codex_rate_limits(scan: int = 12) -> dict:
@@ -395,46 +481,44 @@ def line_summary(claude: dict, codex: dict, cw: dict | None = None) -> str:
 
 
 def full_report(claude: dict, codex: dict, cw: dict) -> str:
+    def plain(line: str) -> str:  # strip SwiftBar "| ..." params for terminal
+        return "  " + line.split(" | ")[0]
+
     out = [line_summary(claude, codex, cw), ""]
-    out.append("Claude — today's spend")
+    out.append("Claude — spend")
     if claude.get("found"):
+        sp = claude.get("spend", {})
+        out.append(f"  today ${sp.get('today', 0):.2f} · 7d ${sp.get('d7', 0):.2f} · 30d ${sp.get('d30', 0):.2f}")
         for model, a in sorted(claude["models"].items(), key=lambda kv: -kv[1]["cost"]):
             out.append(
-                f"  {model}: ${a['cost']:.3f}  "
+                f"    {model}: ${a['cost']:.3f} today  "
                 f"(in {a['input']:,} / out {a['output']:,} / cache_read {a['cache_read']:,})"
             )
-        out.append(f"  total: ${claude['cost']:.2f}")
         if claude.get("dups_skipped"):
             out.append(f"  ({claude['dups_skipped']:,} duplicate entries skipped)")
     else:
-        out.append("  no usage today")
+        out.append("  no usage")
     out.append("")
     out.append("Claude — rate-limit windows")
     if not cw.get("enabled"):
         out.append("  off — enable with: usage.py --enable-claude")
     elif cw.get("found"):
-        for label, key in (("5h", "five_hour"), ("weekly", "seven_day"), ("weekly·opus", "seven_day_opus")):
+        for label, key, wmin in (("5h", "five_hour", 300), ("weekly", "seven_day", 10080),
+                                 ("weekly·opus", "seven_day_opus", 10080)):
             w = cw.get(key)
             if isinstance(w, dict) and w.get("used_percent") is not None:
-                out.append(
-                    f"  {label}: {w['used_percent']:.0f}% used"
-                    f"  · resets in {_fmt_reset(w.get('resets_at'))}"
-                )
+                out.append(plain(_window_line(label, w, wmin)))
     else:
         out.append(f"  {cw.get('error', 'unavailable')}")
     out.append("")
     out.append("Codex — rate-limit windows")
     if codex.get("found"):
-        plan = codex.get("plan_type")
-        if plan:
-            out.append(f"  plan: {plan}")
-        for label, key in (("5h", "primary"), ("weekly", "secondary")):
+        if codex.get("plan_type"):
+            out.append(f"  plan: {codex['plan_type']}")
+        for label, key, wmin in (("5h", "primary", 300), ("weekly", "secondary", 10080)):
             w = codex.get(key) or {}
             if w:
-                out.append(
-                    f"  {label}: {w.get('used_percent', 0):.0f}% used"
-                    f"  · resets in {_fmt_reset(w.get('resets_at'))}"
-                )
+                out.append(plain(_window_line(label, w, wmin)))
     else:
         out.append("  no rate-limit data found")
     return "\n".join(out)
@@ -608,84 +692,155 @@ def gauges_image(items: list[dict], size: int = 26) -> str | None:
     return base64.b64encode(_png_bytes(w, h, rgba)).decode("ascii")
 
 
+# window key → (codex field, claude field, minutes, bar label)
+_WIN_MAP = {
+    "5h": ("primary", "five_hour", 300, "5h"),
+    "weekly": ("secondary", "seven_day", 10080, "wk"),
+}
+
+
+def _window_line(label: str, w: dict, wmin: int) -> str:
+    pct = w.get("used_percent", 0) or 0
+    s = f"{_ring(pct)} {label}: {pct:.0f}% · resets {_fmt_reset(w.get('resets_at'))}"
+    if pct >= 99.5:
+        s += " · at cap"
+    else:
+        pr = _project(pct, w.get("window_minutes") or wmin, w.get("resets_at"))
+        if pr:
+            if pr["eta_min"] is not None:
+                s += f" · ≈cap in {_fmt_reset(time.time() + pr['eta_min'] * 60)}"
+            elif pr["proj"] > pct + 1:
+                s += f" · proj {pr['proj']:.0f}%"
+    return f"{s} | font=Menlo size=12 color={_pct_color(pct)}"
+
+
 def swiftbar_output(claude: dict, codex: dict, cw: dict) -> str:
     """SwiftBar/xbar plugin format: title line, '---', then dropdown items."""
-    # Title color = the single hottest window across both tools.
+    disp = display_cfg()
+    self_path = str(Path(__file__).resolve())
+    tags = {"codex": "C", "claude": "A"}
+    labels = {"codex": "Codex", "claude": "Claude"}
+
+    def win_pct(tool: str, wkey: str):
+        ci, ai, *_ = _WIN_MAP[wkey]
+        src = codex if tool == "codex" else cw
+        if not src.get("found"):
+            return None
+        w = src.get(ci if tool == "codex" else ai)
+        return w.get("used_percent") if isinstance(w, dict) else None
+
+    active = [t for t in disp["tools"]
+              if (t == "codex" and codex.get("found")) or (t == "claude" and cw.get("found"))]
+    wins = disp["windows"] or ["5h"]
+
     worst = 0.0
-    for w in (codex.get("primary"), codex.get("secondary")):
-        if isinstance(w, dict):
-            worst = max(worst, w.get("used_percent", 0) or 0)
-    if cw.get("found"):
-        for w in (cw.get("five_hour"), cw.get("seven_day")):
-            if isinstance(w, dict):
-                worst = max(worst, w.get("used_percent", 0) or 0)
+    for t in active:
+        for wk in wins:
+            p = win_pct(t, wk)
+            if p is not None:
+                worst = max(worst, p)
     title_color = _pct_color(worst)
 
-    # Menu-bar gauges: one labeled 5h ring per tool (C = Codex, A = Claude).
-    items = []
-    cp = (codex.get("primary") or {}).get("used_percent") if codex.get("found") else None
-    if cp is not None:
-        items.append({"tag": "C", "pct": cp})
-    af = (cw.get("five_hour") or {}).get("used_percent") if cw.get("found") else None
-    if af is not None:
-        items.append({"tag": "A", "pct": af})
-    img = None
-    try:
-        img = gauges_image(items) if items else None
-    except Exception:
-        img = None
+    spend_txt = ""
+    if disp["show_spend"] and claude.get("found"):
+        rng = disp["spend_range"]
+        val = claude.get("spend", {}).get(rng, claude.get("cost", 0.0))
+        spend_txt = {"today": "$", "d7": "7d $", "d30": "30d $"}.get(rng, "$") + f"{val:.0f}"
 
-    spend = f"${claude['cost']:.0f}" if claude.get("found") else "—"
-    if img:
-        title = f"{spend} | image={img} size=13 color={title_color}"
+    if disp["style"] == "ring":
+        # one ring per active tool (tagged C/A) for the first selected window
+        items = [{"tag": tags[t], "pct": win_pct(t, wins[0])}
+                 for t in active if win_pct(t, wins[0]) is not None]
+        img = None
+        try:
+            img = gauges_image(items) if items else None
+        except Exception:
+            img = None
+        if img:
+            title = f"{spend_txt or '·'} | image={img} size=13 color={title_color}"
+        else:
+            title = f"{spend_txt or 'Usage Bar'} | size=13 color={title_color}"
     else:
-        title = f"{line_summary(claude, codex, cw)} | size=13 color={title_color}"
+        segs = []
+        for t in active:
+            bits = []
+            for wk in wins:
+                p = win_pct(t, wk)
+                if p is None:
+                    continue
+                wl = _WIN_MAP[wk][3]
+                bits.append(f"{_ring(p)} {wl} {p:.0f}%" if disp["style"] == "harvey"
+                            else f"{wl} {p:.0f}%")
+            if bits:
+                segs.append(f"{labels[t]} " + " ".join(bits))
+        txt = " · ".join(([spend_txt] if spend_txt else []) + segs)
+        title = f"{txt or 'Usage Bar'} | size=13 color={title_color}"
     lines = [title, "---"]
 
-    lines.append("Claude — today's spend | size=11 color=#888888")
-    if claude.get("found"):
-        for model, a in sorted(claude["models"].items(), key=lambda kv: -kv[1]["cost"]):
-            lines.append(f"{model}: ${a['cost']:.2f} | font=Menlo size=12")
-        lines.append(f"total: ${claude['cost']:.2f} | font=Menlo size=12 color=#ffffff")
-        if claude.get("dups_skipped"):
-            lines.append(f"{claude['dups_skipped']:,} duplicate lines skipped | size=10 color=#888888")
-    else:
-        lines.append("no usage today | size=11 color=#888888")
+    def click(label: str, *args: str, term: str = "false") -> str:
+        parts = [f"{label} | bash=/usr/bin/python3", f"param1={self_path}"]
+        parts += [f"param{i}={a}" for i, a in enumerate(args, start=2)]
+        parts.append(f"terminal={term} refresh=true")
+        return " ".join(parts)
 
+    # ── Claude spend (today / 7d / 30d) ──
+    lines.append("Claude — spend | size=11 color=#888888")
+    if claude.get("found"):
+        sp = claude.get("spend", {})
+        lines.append(
+            f"today ${sp.get('today', 0):.2f}  ·  7d ${sp.get('d7', 0):.2f}  ·  30d ${sp.get('d30', 0):.2f} "
+            f"| font=Menlo size=12 color=#ffffff"
+        )
+        for model, a in sorted(claude["models"].items(), key=lambda kv: -kv[1]["cost"]):
+            lines.append(f"  {model}: ${a['cost']:.2f} today | font=Menlo size=11")
+        if claude.get("dups_skipped"):
+            lines.append(f"  {claude['dups_skipped']:,} duplicate lines skipped | size=10 color=#888888")
+    else:
+        lines.append("no usage | size=11 color=#888888")
+
+    # ── Claude windows ──
     lines.append("---")
     lines.append("Claude (A) — rate-limit windows | size=11 color=#888888")
     if not cw.get("enabled"):
         lines.append("Off — shows spend only | size=11 color=#888888")
-        lines.append("Enable (reads your Claude token): | size=11 color=#888888")
-        lines.append("usage.py --enable-claude | font=Menlo size=11 color=#888888")
+        lines.append(click("Enable… (reads your Claude token, shows disclosure)",
+                           "--enable-claude", term="true"))
     elif cw.get("found"):
-        for label, key in (("5h", "five_hour"), ("weekly", "seven_day"), ("weekly·opus", "seven_day_opus")):
+        for label, key, wmin in (("5h", "five_hour", 300), ("weekly", "seven_day", 10080),
+                                 ("weekly·opus", "seven_day_opus", 10080)):
             w = cw.get(key)
             if isinstance(w, dict) and w.get("used_percent") is not None:
-                pct = w["used_percent"]
-                lines.append(
-                    f"{_ring(pct)} {label}: {pct:.0f}% · resets in {_fmt_reset(w.get('resets_at'))} "
-                    f"| font=Menlo size=12 color={_pct_color(pct)}"
-                )
+                lines.append(_window_line(label, w, wmin))
+        lines.append(click("Disable Claude windows", "--disable-claude"))
     else:
         lines.append(f"{cw.get('error', 'unavailable')} | size=11 color=#e67e22")
 
+    # ── Codex windows ──
     lines.append("---")
     lines.append("Codex (C) — rate-limit windows | size=11 color=#888888")
     if codex.get("found"):
-        plan = codex.get("plan_type")
-        if plan:
-            lines.append(f"plan: {plan} | size=11 color=#888888")
-        for label, key in (("5h", "primary"), ("weekly", "secondary")):
+        if codex.get("plan_type"):
+            lines.append(f"plan: {codex['plan_type']} | size=11 color=#888888")
+        for label, key, wmin in (("5h", "primary", 300), ("weekly", "secondary", 10080)):
             w = codex.get(key) or {}
             if w:
-                pct = w.get("used_percent", 0) or 0
-                lines.append(
-                    f"{_ring(pct)} {label}: {pct:.0f}% · resets in {_fmt_reset(w.get('resets_at'))} "
-                    f"| font=Menlo size=12 color={_pct_color(pct)}"
-                )
+                lines.append(_window_line(label, w, wmin))
     else:
         lines.append("no rate-limit data | size=11 color=#888888")
+
+    # ── Settings (click to change) ──
+    lines.append("---")
+    lines.append("Settings | size=11 color=#888888")
+    lines.append(click(f"Style: {disp['style']}  (click to cycle)", "--cycle-style"))
+    spend_state = f"{disp['spend_range']}" if disp["show_spend"] else "hidden"
+    lines.append(click(f"Spend in bar: {spend_state}  (click: toggle)", "--toggle-spend"))
+    lines.append(click("  spend range → next", "--cycle-spend-range"))
+    for t in ("codex", "claude"):
+        lines.append(click(f"Tool {labels[t]}: {'✓ shown' if t in disp['tools'] else '✗ hidden'}",
+                           "--toggle-tool", t))
+    for wk in ("5h", "weekly"):
+        lines.append(click(f"Bar window {wk}: {'✓' if wk in disp['windows'] else '✗'}",
+                           "--toggle-window", wk))
 
     lines.append("---")
     lines.append("Refresh | refresh=true")
@@ -703,8 +858,24 @@ def main(argv: list[str]) -> int:
         set_claude_enabled(False)
         print("Claude rate-limit windows disabled. Claude shows spend only.")
         return 0
+    # Display settings (used by the clickable dropdown items; also usable by hand).
+    if "--cycle-style" in argv:
+        cycle_display("style")
+        return 0
+    if "--cycle-spend-range" in argv:
+        cycle_display("spend_range")
+        return 0
+    if "--toggle-spend" in argv:
+        toggle_display_bool("show_spend")
+        return 0
+    if "--toggle-tool" in argv:
+        toggle_display_list("tools", argv[argv.index("--toggle-tool") + 1])
+        return 0
+    if "--toggle-window" in argv:
+        toggle_display_list("windows", argv[argv.index("--toggle-window") + 1])
+        return 0
 
-    claude = claude_today()
+    claude = claude_spend()
     codex = codex_rate_limits()
     cw = claude_windows()
     if "--json" in argv:

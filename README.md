@@ -60,6 +60,25 @@ python3 usage.py --full     # per-window + per-model breakdown
 python3 usage.py --json     # machine-readable
 ```
 
+## Customize
+
+The dropdown has a **Settings** section you can click to change things live (no config
+editing, no restart):
+
+- **Style** — `ring` (drawn gauges) · `harvey` (○◔◑◕● glyphs) · `text` (plain %).
+- **Tools** — show/hide Codex or Claude in the menu bar.
+- **Bar windows** — show the 5h and/or weekly window in the bar (the dropdown always
+  shows both).
+- **Spend** — show/hide, and switch the range shown in the bar: today · 7d · 30d.
+
+Settings persist in `~/.config/usage-bar/config.json`. The same actions are available as
+flags (`--cycle-style`, `--toggle-tool codex`, `--toggle-window weekly`, `--toggle-spend`,
+`--cycle-spend-range`).
+
+The dropdown also shows **multi-range spend** (today / 7d / 30d) and a **burn-rate
+projection** per window — e.g. "≈cap in 1h51m" or "proj 84%" — computed from the current
+fill, the window length, and the reset time.
+
 ## Claude windows (opt-in)
 
 ```sh

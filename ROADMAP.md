@@ -178,3 +178,13 @@ panel to grant a security-scoped bookmark, which `defaults` can't create).
   usage endpoint, (b) make one tiny API request and read `anthropic-ratelimit-*` response
   headers, or (c) find/parse a local usage cache Claude writes after `/status`.
 - (a) and (b) touch credentials / make network calls → need explicit user sign-off.
+
+### v1.6 — customization + ccusage-inspired (done 2026-07-01)
+- [x] **Live customization** via a clickable Settings section in the dropdown (SwiftBar
+      `bash=`/`param`/`refresh=true`): style (ring/harvey/text), tools on/off, which windows
+      in the bar, spend show/hide + range. Persists in `~/.config/usage-bar/config.json`;
+      same actions exposed as `--cycle-*`/`--toggle-*` flags.
+- [x] **Multi-range spend** (today / 7d / 30d) — Claude reader buckets by date in one pass;
+      shown in the dropdown and selectable for the bar.
+- [x] **Window projection** (ccusage `blocks --active` idea, zero-persistence): from current
+      %, window length, and reset time → "≈cap in Xm" or "proj N%"; "at cap" at 100%.
