@@ -657,7 +657,15 @@ def _ring_rgba(pct: float, rgb: tuple[float, float, float], size: int, ss: int =
                 out[i + 3] = int(sa / n * 255)
     fs = max(1, size // 22)
     if center:
-        _blit(out, size, size, center, size / 2, size / 2, fs, rgb)  # lightest weight
+        # Largest font scale whose glyph block fits the (thin-ring) inner circle.
+        inner = 0.72 * size  # inner diameter in target px (r_in = 0.36 * sw)
+        cscale = fs
+        for s in (4, 3, 2, 1):
+            gw = s * (4 * len(center) - 1)  # 3px glyph + 1px gap per char
+            if gw <= inner * 0.94 and 5 * s <= inner * 0.94:
+                cscale = s
+                break
+        _blit(out, size, size, center, size / 2, size / 2, cscale, rgb)
     if top:
         _blit(out, size, size, top, size / 2, size * 0.35, fs, rgb)
     if bottom:
@@ -679,7 +687,7 @@ def _compose_h(layers: list[bytearray], size: int, gap: int = 2) -> tuple[int, i
     return w, size, bytes(out)
 
 
-def _gauge_cell(tag: str, pct: float, ring: int = 26, label_scale: int = 2) -> tuple[int, int, bytearray]:
+def _gauge_cell(tag: str, pct: float, ring: int = 30, label_scale: int = 2) -> tuple[int, int, bytearray]:
     """One gauge: a name letter to the left, a ring with the % centered inside."""
     rgb = _hex_rgb(_pct_color(pct))
     ring_buf = _ring_rgba(pct, rgb, ring, center=f"{pct:.0f}")
@@ -697,7 +705,7 @@ def _gauge_cell(tag: str, pct: float, ring: int = 26, label_scale: int = 2) -> t
     return w, h, cell
 
 
-def gauges_image(items: list[dict], ring: int = 26) -> str | None:
+def gauges_image(items: list[dict], ring: int = 30) -> str | None:
     """Base64 PNG: a row of "<name> (ring with % inside)" gauges.
     items: [{"tag": "C", "pct": 73.0}, ...]"""
     cells = [_gauge_cell(it["tag"], it["pct"], ring) for it in items]
