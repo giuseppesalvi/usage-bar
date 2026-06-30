@@ -785,7 +785,8 @@ def swiftbar_output(claude: dict, codex: dict, cw: dict) -> str:
         except Exception:
             img = None
         if img:
-            title = f"{spend_txt or '·'} | image={img} size=13 color={title_color}"
+            # spend hidden -> image only (no stray placeholder text)
+            title = f"{spend_txt} | image={img} size=13 color={title_color}"
         else:
             title = f"{spend_txt or 'Usage Bar'} | size=13 color={title_color}"
     else:
