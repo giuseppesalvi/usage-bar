@@ -113,16 +113,19 @@ def set_claude_enabled(on: bool) -> None:
 
 # ── Display customization (editable live from the dropdown) ──
 DISPLAY_DEFAULTS = {
-    "style": "ring",                 # ring | harvey | text
+    "style": "ring",                 # ring | bar | number | harvey | text
+    "mark": "letter",                # letter (C/A) | logo (drawn symbol)
     "tools": ["codex", "claude"],    # which tools appear in the menu bar
     "windows": ["5h"],               # which windows in the bar: 5h and/or weekly
     "show_spend": True,
     "spend_range": "today",          # today | d7 | d30
 }
 _DISPLAY_CHOICES = {
-    "style": ["ring", "harvey", "text"],
+    "style": ["ring", "bar", "number", "harvey", "text"],
+    "mark": ["letter", "logo"],
     "spend_range": ["today", "d7", "d30"],
 }
+_IMAGE_STYLES = ("ring", "bar", "number")
 _DISPLAY_LISTS = {"tools": ["codex", "claude"], "windows": ["5h", "weekly"]}
 
 
@@ -162,6 +165,72 @@ def toggle_display_list(key: str, item: str) -> None:
 
 def toggle_display_bool(key: str) -> None:
     set_display(key, not bool(display_cfg().get(key)))
+
+
+# ── Notifications + staleness (CodexBar-style, still local-only) ──
+NOTIFY_DEFAULTS = {"enabled": True, "threshold": 90}
+NOTIFY_THRESHOLDS = [80, 90, 95]
+NOTIFY_STATE = CONFIG_DIR / "notify-state.json"
+STALE_SECS = 30 * 60  # a Codex snapshot older than this is stale -> dim the ring
+
+
+def notify_cfg() -> dict:
+    return {**NOTIFY_DEFAULTS, **_load_config().get("notify", {})}
+
+
+def _load_notify_state() -> dict:
+    try:
+        return json.loads(NOTIFY_STATE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_notify_state(state: dict) -> None:
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        NOTIFY_STATE.write_text(json.dumps(state))
+    except OSError:
+        pass
+
+
+def _notify(title: str, text: str) -> None:
+    """Fire a native macOS banner (no deps). Best-effort; never raises."""
+    try:
+        subprocess.run(
+            ["osascript", "-e",
+             f"display notification {json.dumps(text)} with title {json.dumps(title)}"],
+            capture_output=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def check_notifications(codex: dict, cw: dict) -> None:
+    """Notify once per window per reset-cycle when usage crosses the threshold.
+    Dedup key is (tool:window) -> the resets_at we last alerted for, so a new
+    cycle (new resets_at) re-arms the alert. Called only on the periodic run."""
+    cfg = notify_cfg()
+    if not cfg.get("enabled"):
+        return
+    thr = float(cfg.get("threshold", 90))
+    checks = []  # (key, tool, window_label, pct, resets_at)
+    for src, tool, field_idx in ((codex, "Codex", 0), (cw, "Claude", 1)):
+        if not src.get("found"):
+            continue
+        for wk, spec in _WIN_MAP.items():
+            w = src.get(spec[field_idx]) or {}
+            if isinstance(w, dict) and w.get("used_percent") is not None:
+                checks.append((f"{tool.lower()}:{wk}", tool, spec[3],
+                               w["used_percent"], w.get("resets_at")))
+    state = _load_notify_state()
+    changed = False
+    for key, tool, wl, pct, resets_at in checks:
+        if pct >= thr and state.get(key) != str(resets_at):
+            _notify("Usage Bar", f"{tool} {wl} at {pct:.0f}% · resets {_fmt_reset(resets_at)}")
+            state[key] = str(resets_at)
+            changed = True
+    if changed:
+        _save_notify_state(state)
 
 
 _WINDOW_MINUTES = {"5h": 300, "weekly": 10080, "five_hour": 300, "seven_day": 10080}
@@ -533,6 +602,19 @@ def _pct_color(pct: float) -> str:
     return "#2ecc71"
 
 
+_MENU_TEXT = "#1f2933"
+_MENU_MUTED = "#5f6670"
+
+
+def _menu_pct_color(pct: float) -> str:
+    """Darker threshold colors for the translucent macOS dropdown."""
+    if pct >= 90:
+        return "#b91c1c"
+    if pct >= 70:
+        return "#b45309"
+    return "#15803d"
+
+
 # ── Ring gauge: an anti-aliased PNG progress ring, drawn with stdlib only ──
 import base64
 import math
@@ -582,6 +664,8 @@ _FONT = {
     "7": ("111", "001", "010", "100", "100"),
     "8": ("111", "101", "111", "101", "111"),
     "9": ("111", "101", "111", "001", "111"),
+    "$": ("111", "110", "111", "011", "111"),
+    "D": ("110", "101", "101", "101", "110"),
     "C": ("111", "100", "100", "100", "111"),
     "A": ("010", "101", "111", "101", "101"),
 }
@@ -611,6 +695,157 @@ def _blit(out: bytearray, W: int, H: int, text: str, cx: float, cy: float,
                                     i = (py * W + px) * 4
                                     out[i], out[i + 1], out[i + 2], out[i + 3] = r, g, b, 255
         x += cw + gap
+
+
+# 30×30 logo bitmaps derived from the source SVG silhouettes and rendered as
+# monochrome pixels so SwiftBar can keep using a single generated PNG.
+_LOGO = {
+    # Claude/Anthropic: Simple Icons "Anthropic" mark. The Claude spark loses
+    # too much detail at 30 px; the Anthropic A remains legible and clean.
+    "claude": (
+        "000000000000000000000000000000",
+        "000000000000000000000000000000",
+        "000000000000000000000000000000",
+        "000000000000000000000000000000",
+        "000000000000000000000000000000",
+        "000000000000000000000000000000",
+        "000000000000000000000000000000",
+        "000000000111110001111000000000",
+        "000000000111110001111000000000",
+        "000000001111110000111100000000",
+        "000000001111111000111100000000",
+        "000000011111111000011110000000",
+        "000000011111111100011110000000",
+        "000000011111111100011110000000",
+        "000000111111111100001111000000",
+        "000000111111111110001111000000",
+        "000001111111111110000111100000",
+        "000001111111111111000111100000",
+        "000001111111111111000111100000",
+        "000011111111111111000011110000",
+        "000011111111111111100011110000",
+        "000111110000000111100001111000",
+        "000111100000000011110001111000",
+        "000111100000000011110001111000",
+        "001111000000000011110000111100",
+        "000000000000000000000000000000",
+        "000000000000000000000000000000",
+        "000000000000000000000000000000",
+        "000000000000000000000000000000",
+        "000000000000000000000000000000",
+        "000000000000000000000000000000",
+    ),
+    # Codex: OpenAI blossom symbol used with the Codex wordmark.
+    "codex": (
+        "000000000000000000000000000000",
+        "000000000000000000000000000000",
+        "000000000000000000000000000000",
+        "000000000000000000000000000000",
+        "000000000000111000000000000000",
+        "000000000011111110000000000000",
+        "000000000110000111111100000000",
+        "000000000100001110000110000000",
+        "000000001100111000000011000000",
+        "000000111001100001110011000000",
+        "000001101001100111111001000000",
+        "000001001001111110001111000000",
+        "000001001001110011000011000000",
+        "000001001001100001110001100000",
+        "000001001101100001111100110000",
+        "000001001111100001101100110000",
+        "000001100011100001100100110000",
+        "000000110000110011100100110000",
+        "000000111100011111100100100000",
+        "000000100111111001100101100000",
+        "000000100011100001100111000000",
+        "000000110000000111001100000000",
+        "000000011000011100011000000000",
+        "000000001111111000011000000000",
+        "000000000000011111110000000000",
+        "000000000000000111000000000000",
+        "000000000000000000000000000000",
+        "000000000000000000000000000000",
+        "000000000000000000000000000000",
+        "000000000000000000000000000000",
+    ),
+}
+_TAG_TOOL = {"C": "codex", "A": "claude"}
+
+
+def _blit_rows(out: bytearray, W: int, H: int, rows: tuple[str, ...],
+               cx: float, cy: float, scale: int, rgb: tuple[float, float, float]) -> None:
+    """Draw a bitmap (rows of '0'/'1') centered on (cx, cy) into an RGBA buffer."""
+    gh, gw = len(rows), len(rows[0])
+    x0 = int(round(cx - gw * scale / 2))
+    y0 = int(round(cy - gh * scale / 2))
+    r, g, b = int(rgb[0] * 255), int(rgb[1] * 255), int(rgb[2] * 255)
+    for ry, row in enumerate(rows):
+        for rx, ch in enumerate(row):
+            if ch != "1":
+                continue
+            for yy in range(scale):
+                py = y0 + ry * scale + yy
+                if not 0 <= py < H:
+                    continue
+                for xx in range(scale):
+                    px = x0 + rx * scale + xx
+                    if 0 <= px < W:
+                        i = (py * W + px) * 4
+                        out[i], out[i + 1], out[i + 2], out[i + 3] = r, g, b, 255
+
+
+def _mark_w(tag: str, mark: str, scale: int) -> int:
+    rows = _LOGO.get(_TAG_TOOL.get(tag)) if mark == "logo" else None
+    if rows:
+        return len(rows[0])
+    return 3 * scale
+
+
+def _rows_ink_center(rows: tuple[str, ...]) -> tuple[float, float]:
+    xs, ys = [], []
+    for y, row in enumerate(rows):
+        for x, ch in enumerate(row):
+            if ch == "1":
+                xs.append(x)
+                ys.append(y)
+    if not xs:
+        return len(rows[0]) / 2, len(rows) / 2
+    return (min(xs) + max(xs) + 1) / 2, (min(ys) + max(ys) + 1) / 2
+
+
+def _draw_mark(out: bytearray, W: int, H: int, tag: str, mark: str,
+               cx: float, cy: float, scale: int, rgb: tuple[float, float, float]) -> None:
+    """Draw the tool identifier: a C/A letter, or the drawn logo symbol."""
+    if mark == "logo":
+        rows = _LOGO.get(_TAG_TOOL.get(tag))
+        if rows:
+            ix, iy = _rows_ink_center(rows)
+            cx += len(rows[0]) / 2 - ix
+            cy += len(rows) / 2 - iy
+            _blit_rows(out, W, H, rows, cx, cy, 1, rgb)
+            return
+    _blit(out, W, H, tag, cx, cy, scale, rgb)
+
+
+def _hbar(out: bytearray, W: int, H: int, x: int, y: int, bw: int, bh: int,
+          frac: float, rgb: tuple[float, float, float]) -> None:
+    """A slim horizontal progress bar: colored fill over a faint track."""
+    track, ta = (0.55, 0.55, 0.58), 0.34
+    fill = int(round(bw * max(0.0, min(1.0, frac))))
+    for yy in range(bh):
+        py = y + yy
+        if not 0 <= py < H:
+            continue
+        for xx in range(bw):
+            px = x + xx
+            if not 0 <= px < W:
+                continue
+            col, a = (rgb, 1.0) if xx < fill else (track, ta)
+            i = (py * W + px) * 4
+            out[i] = int(col[0] * 255)
+            out[i + 1] = int(col[1] * 255)
+            out[i + 2] = int(col[2] * 255)
+            out[i + 3] = int(a * 255)
 
 
 def _ring_rgba(pct: float, rgb: tuple[float, float, float], size: int, ss: int = 3,
@@ -660,8 +895,9 @@ def _ring_rgba(pct: float, rgb: tuple[float, float, float], size: int, ss: int =
         # Largest font scale whose glyph block fits the (thin-ring) inner circle.
         inner = 0.72 * size  # inner diameter in target px (r_in = 0.36 * sw)
         cscale = fs
+        fit_len = max(2, len(center))
         for s in (4, 3, 2, 1):
-            gw = s * (4 * len(center) - 1)  # 3px glyph + 1px gap per char
+            gw = s * (4 * fit_len - 1)  # 3px glyph + 1px gap per char
             if gw <= inner * 0.94 and 5 * s <= inner * 0.94:
                 cscale = s
                 break
@@ -687,17 +923,39 @@ def _compose_h(layers: list[bytearray], size: int, gap: int = 2) -> tuple[int, i
     return w, size, bytes(out)
 
 
-def _gauge_cell(tag: str, pct: float, ring: int = 30, label_scale: int = 2) -> tuple[int, int, bytearray]:
-    """One gauge: a name letter to the left, a ring with the % centered inside."""
+_MARK_SCALE = 2  # both the C/A letter and the logo are drawn at this pixel scale
+
+
+def _cell_rgb(pct: float, stale: bool) -> tuple[float, float, float]:
     rgb = _hex_rgb(_pct_color(pct))
-    ring_buf = _ring_rgba(pct, rgb, ring, center=f"{pct:.0f}")
-    label_w = 3 * label_scale
-    gap = 2
-    w = label_w + gap + ring
-    h = ring
+    if stale:
+        rgb = tuple(c * 0.45 + 0.275 for c in rgb)  # blend 55% toward mid-gray
+    return rgb
+
+
+def _num_w(text: str, scale: int) -> int:
+    return len(text) * 3 * scale + (len(text) - 1) * scale  # 3px glyph + 1px gap
+
+
+def _text_cell(text: str, rgb: tuple[float, float, float], h: int = 30,
+               scale: int = 3) -> tuple[int, int, bytearray]:
+    w = _num_w(text, scale)
     cell = bytearray(w * h * 4)
-    _blit(cell, w, h, tag, label_w / 2, h / 2, label_scale, rgb)  # name, left, centered
-    x0 = label_w + gap
+    _blit(cell, w, h, text, w / 2, h / 2, scale, rgb)
+    return w, h, cell
+
+
+def _gauge_cell(tag: str, pct: float, mark: str = "letter", ring: int = 30,
+                stale: bool = False) -> tuple[int, int, bytearray]:
+    """Ring style: the tool mark (letter/logo) left, a ring with % centered inside."""
+    rgb = _cell_rgb(pct, stale)
+    ring_buf = _ring_rgba(pct, rgb, ring, center=f"{pct:.0f}")
+    mark_w = _mark_w(tag, mark, _MARK_SCALE)
+    gap = 2
+    w, h = mark_w + gap + ring, ring
+    cell = bytearray(w * h * 4)
+    _draw_mark(cell, w, h, tag, mark, mark_w / 2, h / 2, _MARK_SCALE, rgb)
+    x0 = mark_w + gap
     for y in range(ring):  # paste ring on the right
         src = y * ring * 4
         dst = (y * w + x0) * 4
@@ -705,17 +963,52 @@ def _gauge_cell(tag: str, pct: float, ring: int = 30, label_scale: int = 2) -> t
     return w, h, cell
 
 
-def gauges_image(items: list[dict], ring: int = 30) -> str | None:
-    """Base64 PNG: a row of "<name> (ring with % inside)" gauges.
-    items: [{"tag": "C", "pct": 73.0}, ...]"""
-    cells = [_gauge_cell(it["tag"], it["pct"], ring) for it in items]
-    if not cells:
-        return None
-    gap = 6
+def _number_cell(tag: str, pct: float, mark: str = "letter", h: int = 30,
+                 stale: bool = False) -> tuple[int, int, bytearray]:
+    """Number style: the tool mark left, a big threshold-colored % right. No ring."""
+    rgb = _cell_rgb(pct, stale)
+    num = f"{pct:.0f}"
+    nscale = 5
+    num_w = _num_w(num, nscale)
+    mark_w = _mark_w(tag, mark, _MARK_SCALE)
+    gap = 4
+    w = mark_w + gap + num_w
+    cell = bytearray(w * h * 4)
+    _draw_mark(cell, w, h, tag, mark, mark_w / 2, h / 2, _MARK_SCALE, rgb)
+    _blit(cell, w, h, num, mark_w + gap + num_w / 2, h / 2, nscale, rgb)
+    return w, h, cell
+
+
+def _bar_cell(tag: str, pct: float, mark: str = "letter", h: int = 30,
+              stale: bool = False) -> tuple[int, int, bytearray]:
+    """Bar style: the tool mark, a slim horizontal fill bar, then a big %."""
+    rgb = _cell_rgb(pct, stale)
+    num = f"{pct:.0f}"
+    nscale = 4
+    num_w = _num_w(num, nscale)
+    bar_w, bar_h = 40, 8
+    mark_w = _mark_w(tag, mark, _MARK_SCALE)
+    gap = 4
+    w = mark_w + gap + bar_w + gap + num_w
+    cell = bytearray(w * h * 4)
+    _draw_mark(cell, w, h, tag, mark, mark_w / 2, h / 2, _MARK_SCALE, rgb)
+    bx = mark_w + gap
+    _hbar(cell, w, h, bx, (h - bar_h) // 2, bar_w, bar_h, pct / 100.0, rgb)
+    _blit(cell, w, h, num, bx + bar_w + gap + num_w / 2, h / 2, nscale, rgb)
+    return w, h, cell
+
+
+_CELL_BUILDERS = {"ring": _gauge_cell, "number": _number_cell, "bar": _bar_cell}
+
+
+def _compose_cells(cells: list[tuple[int, int, bytearray]],
+                   gap: int = 8, pad: int = 3) -> tuple[int, int, bytearray]:
+    """Lay square/rect cells in a row, centered vertically; pad keeps the
+    first/last glyph off the menu-bar edge. Returns (w, h, RGBA)."""
     h = max(c[1] for c in cells)
-    w = sum(c[0] for c in cells) + gap * (len(cells) - 1)
+    w = sum(c[0] for c in cells) + gap * (len(cells) - 1) + 2 * pad
     out = bytearray(w * h * 4)
-    x = 0
+    x = pad
     for cw, ch, cbuf in cells:
         yoff = (h - ch) // 2
         for y in range(ch):
@@ -723,6 +1016,22 @@ def gauges_image(items: list[dict], ring: int = 30) -> str | None:
             dst = ((y + yoff) * w + x) * 4
             out[dst:dst + cw * 4] = cbuf[src:src + cw * 4]
         x += cw + gap
+    return w, h, out
+
+
+def bar_image(items: list[dict], style: str = "ring", mark: str = "letter",
+              prefix: str = "") -> str | None:
+    """Base64 PNG: a row of per-tool cells in the chosen image style.
+    items: [{"tag": "C", "pct": 73.0, "stale": False}, ...]"""
+    build = _CELL_BUILDERS.get(style)
+    if not build or not items:
+        return None
+    cells = [build(it["tag"], it["pct"], mark=mark, stale=it.get("stale", False))
+             for it in items]
+    if prefix:
+        worst = max((it.get("pct") or 0) for it in items)
+        cells.insert(0, _text_cell(prefix, _hex_rgb(_pct_color(worst))))
+    w, h, out = _compose_cells(cells)
     return base64.b64encode(_png_bytes(w, h, out)).decode("ascii")
 
 
@@ -745,7 +1054,7 @@ def _window_line(label: str, w: dict, wmin: int) -> str:
                 s += f" · ≈cap in {_fmt_reset(time.time() + pr['eta_min'] * 60)}"
             elif pr["proj"] > pct + 1:
                 s += f" · proj {pr['proj']:.0f}%"
-    return f"{s} | font=Menlo size=12 color={_pct_color(pct)}"
+    return f"{s} | font=Menlo size=12 color={_menu_pct_color(pct)}"
 
 
 def swiftbar_output(claude: dict, codex: dict, cw: dict) -> str:
@@ -767,6 +1076,12 @@ def swiftbar_output(claude: dict, codex: dict, cw: dict) -> str:
               if (t == "codex" and codex.get("found")) or (t == "claude" and cw.get("found"))]
     wins = disp["windows"] or ["5h"]
 
+    # Codex windows come from the newest rollout log; if you haven't run Codex in
+    # a while that snapshot is stale (Claude spend/windows are recomputed each run).
+    codex_ep = _iso_to_epoch(codex.get("timestamp")) if codex.get("found") else None
+    codex_age = (time.time() - codex_ep) if codex_ep else None
+    codex_stale = codex_age is not None and codex_age > STALE_SECS
+
     worst = 0.0
     for t in active:
         for wk in wins:
@@ -776,23 +1091,26 @@ def swiftbar_output(claude: dict, codex: dict, cw: dict) -> str:
     title_color = _pct_color(worst)
 
     spend_txt = ""
+    spend_img_txt = ""
     if disp["show_spend"] and claude.get("found"):
         rng = disp["spend_range"]
         val = claude.get("spend", {}).get(rng, claude.get("cost", 0.0))
         spend_txt = {"today": "$", "d7": "7d $", "d30": "30d $"}.get(rng, "$") + f"{val:.0f}"
+        spend_img_txt = {"today": "$", "d7": "7D$", "d30": "30D$"}.get(rng, "$") + f"{val:.0f}"
 
-    if disp["style"] == "ring":
-        # one ring per active tool (tagged C/A) for the first selected window
-        items = [{"tag": tags[t], "pct": win_pct(t, wins[0])}
+    if disp["style"] in _IMAGE_STYLES:
+        # one cell per active tool (tagged C/A) for the first selected window
+        items = [{"tag": tags[t], "pct": win_pct(t, wins[0]),
+                  "stale": t == "codex" and codex_stale}
                  for t in active if win_pct(t, wins[0]) is not None]
         img = None
         try:
-            img = gauges_image(items) if items else None
+            img = bar_image(items, disp["style"], disp.get("mark", "letter"), spend_img_txt) if items else None
         except Exception:
             img = None
         if img:
-            # spend hidden -> image only (no stray placeholder text)
-            title = f"{spend_txt} | image={img} size=13 color={title_color}"
+            # Keep image styles as image-only: text + image is flaky in SwiftBar.
+            title = f" | image={img} size=13 color={title_color}"
         else:
             title = f"{spend_txt or 'Usage Bar'} | size=13 color={title_color}"
     else:
@@ -819,25 +1137,25 @@ def swiftbar_output(claude: dict, codex: dict, cw: dict) -> str:
         return " ".join(parts)
 
     # ── Claude spend (today / 7d / 30d) ──
-    lines.append("Claude — spend | size=11 color=#888888")
+    lines.append(f"Claude — spend | size=11 color={_MENU_MUTED}")
     if claude.get("found"):
         sp = claude.get("spend", {})
         lines.append(
             f"today ${sp.get('today', 0):.2f}  ·  7d ${sp.get('d7', 0):.2f}  ·  30d ${sp.get('d30', 0):.2f} "
-            f"| font=Menlo size=12 color=#ffffff"
+            f"| font=Menlo size=12 color={_MENU_TEXT}"
         )
         for model, a in sorted(claude["models"].items(), key=lambda kv: -kv[1]["cost"]):
-            lines.append(f"  {model}: ${a['cost']:.2f} today | font=Menlo size=11")
+            lines.append(f"  {model}: ${a['cost']:.2f} today | font=Menlo size=11 color={_MENU_TEXT}")
         if claude.get("dups_skipped"):
-            lines.append(f"  {claude['dups_skipped']:,} duplicate lines skipped | size=10 color=#888888")
+            lines.append(f"  {claude['dups_skipped']:,} duplicate lines skipped | size=10 color={_MENU_MUTED}")
     else:
-        lines.append("no usage | size=11 color=#888888")
+        lines.append(f"no usage | size=11 color={_MENU_MUTED}")
 
     # ── Claude windows ──
     lines.append("---")
-    lines.append("Claude (A) — rate-limit windows | size=11 color=#888888")
+    lines.append(f"Claude (A) — rate-limit windows | size=11 color={_MENU_MUTED}")
     if not cw.get("enabled"):
-        lines.append("Off — shows spend only | size=11 color=#888888")
+        lines.append(f"Off — shows spend only | size=11 color={_MENU_MUTED}")
         lines.append(click("Enable… (reads your Claude token, shows disclosure)",
                            "--enable-claude", term="true"))
     elif cw.get("found"):
@@ -852,30 +1170,54 @@ def swiftbar_output(claude: dict, codex: dict, cw: dict) -> str:
 
     # ── Codex windows ──
     lines.append("---")
-    lines.append("Codex (C) — rate-limit windows | size=11 color=#888888")
+    codex_hdr = "Codex (C) — rate-limit windows"
+    if codex.get("found") and codex_stale:
+        codex_hdr += f" · stale ({_fmt_reset(time.time() + codex_age)} old)"
+    lines.append(f"{codex_hdr} | size=11 color={_MENU_MUTED}")
     if codex.get("found"):
         if codex.get("plan_type"):
-            lines.append(f"plan: {codex['plan_type']} | size=11 color=#888888")
+            lines.append(f"plan: {codex['plan_type']} | size=11 color={_MENU_MUTED}")
         for label, key, wmin in (("5h", "primary", 300), ("weekly", "secondary", 10080)):
             w = codex.get(key) or {}
             if w:
                 lines.append(_window_line(label, w, wmin))
     else:
-        lines.append("no rate-limit data | size=11 color=#888888")
+        lines.append(f"no rate-limit data | size=11 color={_MENU_MUTED}")
 
-    # ── Settings (click to change) ──
+    # ── Settings — each is a submenu of radio choices; one click sets the value
+    #    (macOS always closes the menu on any click, so direct-select beats cycling).
     lines.append("---")
-    lines.append("Settings | size=11 color=#888888")
-    lines.append(click(f"Style: {disp['style']}  (click to cycle)", "--cycle-style"))
-    spend_state = f"{disp['spend_range']}" if disp["show_spend"] else "hidden"
-    lines.append(click(f"Spend in bar: {spend_state}  (click: toggle)", "--toggle-spend"))
-    lines.append(click("  spend range → next", "--cycle-spend-range"))
+    lines.append(f"Settings | size=11 color={_MENU_MUTED}")
+
+    def radio(title: str, cur: str, options, *set_args: str) -> None:
+        lines.append(f"{title}: {cur} | size=12 color={_MENU_TEXT}")
+        for lbl, val in options:
+            dot = "●" if cur == val else "○"
+            lines.append("-- " + click(f"{dot} {lbl}", *set_args, val))
+
+    radio("Style", disp["style"], [(s, s) for s in _DISPLAY_CHOICES["style"]],
+          "--set-display", "style")
+    mark = disp.get("mark", "letter")
+    radio("Tool mark", mark,
+          [("letter — C / A", "letter"), ("logo — drawn symbols", "logo")],
+          "--set-display", "mark")
+    cur_spend = disp["spend_range"] if disp["show_spend"] else "hidden"
+    radio("Spend in bar", cur_spend,
+          [("hidden", "hidden"), ("today", "today"), ("7d", "d7"), ("30d", "d30")],
+          "--set-spend")
+
     for t in ("codex", "claude"):
         lines.append(click(f"Tool {labels[t]}: {'✓ shown' if t in disp['tools'] else '✗ hidden'}",
                            "--toggle-tool", t))
     for wk in ("5h", "weekly"):
         lines.append(click(f"Bar window {wk}: {'✓' if wk in disp['windows'] else '✗'}",
                            "--toggle-window", wk))
+
+    ncfg = notify_cfg()
+    ncur = f"≥{int(ncfg['threshold'])}%" if ncfg["enabled"] else "off"
+    radio("Notify near cap", ncur,
+          [("off", "off")] + [(f"≥{th}%", f"≥{th}%") for th in NOTIFY_THRESHOLDS],
+          "--set-notify")
 
     lines.append("---")
     lines.append("Refresh | refresh=true")
@@ -909,6 +1251,47 @@ def main(argv: list[str]) -> int:
     if "--toggle-window" in argv:
         toggle_display_list("windows", argv[argv.index("--toggle-window") + 1])
         return 0
+    if "--toggle-notify" in argv:
+        cfg = _load_config()
+        cfg.setdefault("notify", {})["enabled"] = not notify_cfg()["enabled"]
+        _save_config(cfg)
+        return 0
+    if "--cycle-notify-threshold" in argv:
+        cur = notify_cfg()["threshold"]
+        nxt = (NOTIFY_THRESHOLDS[(NOTIFY_THRESHOLDS.index(cur) + 1) % len(NOTIFY_THRESHOLDS)]
+               if cur in NOTIFY_THRESHOLDS else NOTIFY_THRESHOLDS[0])
+        cfg = _load_config()
+        cfg.setdefault("notify", {})["threshold"] = nxt
+        _save_config(cfg)
+        return 0
+    # Direct-select handlers used by the radio submenus (also usable by hand).
+    if "--set-display" in argv:
+        i = argv.index("--set-display")
+        key, val = argv[i + 1], argv[i + 2]
+        if val in _DISPLAY_CHOICES.get(key, []):
+            set_display(key, val)
+        return 0
+    if "--set-spend" in argv:
+        v = argv[argv.index("--set-spend") + 1]
+        if v == "hidden":
+            set_display("show_spend", False)
+        elif v in _DISPLAY_CHOICES["spend_range"]:
+            set_display("show_spend", True)
+            set_display("spend_range", v)
+        return 0
+    if "--set-notify" in argv:
+        v = argv[argv.index("--set-notify") + 1]
+        cfg = _load_config()
+        n = cfg.setdefault("notify", {})
+        if v == "off":
+            n["enabled"] = False
+        else:
+            digits = "".join(c for c in v if c.isdigit())
+            if digits:
+                n["enabled"] = True
+                n["threshold"] = int(digits)
+        _save_config(cfg)
+        return 0
 
     claude = claude_spend()
     codex = codex_rate_limits()
@@ -916,6 +1299,7 @@ def main(argv: list[str]) -> int:
     if "--json" in argv:
         print(json.dumps({"claude": claude, "codex": codex, "claude_windows": cw}, indent=2))
     elif "--swiftbar" in argv:
+        check_notifications(codex, cw)  # only the periodic run alerts
         print(swiftbar_output(claude, codex, cw))
     elif "--full" in argv:
         print(full_report(claude, codex, cw))

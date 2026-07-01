@@ -62,22 +62,37 @@ python3 usage.py --json     # machine-readable
 
 ## Customize
 
-The dropdown has a **Settings** section you can click to change things live (no config
-editing, no restart):
+The dropdown has a **Settings** section — each option is a small submenu of radio
+choices, so one click sets the exact value (no restart, no config editing). macOS always
+closes a menu-bar dropdown on any click, so direct-select beats cycling.
 
-- **Style** — `ring` (drawn gauges) · `harvey` (○◔◑◕● glyphs) · `text` (plain %).
+- **Style** — `ring` (drawn gauge, % inside) · `bar` (slim fill bar + big %) ·
+  `number` (just a big %) · `harvey` (○◔◑◕● glyphs) · `text` (plain %).
+- **Tool mark** — how each tool is labelled in the drawn styles: `letter` (C / A) or
+  `logo` (small drawn symbols — OpenAI blossom for Codex, Anthropic A for Claude).
 - **Tools** — show/hide Codex or Claude in the menu bar.
 - **Bar windows** — show the 5h and/or weekly window in the bar (the dropdown always
   shows both).
-- **Spend** — show/hide, and switch the range shown in the bar: today · 7d · 30d.
+- **Spend** — hidden, or the range shown in the bar: today · 7d · 30d.
+- **Notify near cap** — off, or the threshold (80 / 90 / 95%).
 
 Settings persist in `~/.config/usage-bar/config.json`. The same actions are available as
-flags (`--cycle-style`, `--toggle-tool codex`, `--toggle-window weekly`, `--toggle-spend`,
-`--cycle-spend-range`).
+flags (`--set-display style bar`, `--set-display mark logo`, `--toggle-tool codex`,
+`--toggle-window weekly`, `--set-spend d7`, `--set-notify 90`).
 
 The dropdown also shows **multi-range spend** (today / 7d / 30d) and a **burn-rate
 projection** per window — e.g. "≈cap in 1h51m" or "proj 84%" — computed from the current
 fill, the window length, and the reset time.
+
+## Alerts & staleness
+
+- **Near-cap notifications** — when any window crosses the threshold (default 90%), a
+  native macOS banner fires *once* per window per reset cycle (no nagging; a new cycle
+  re-arms it). Local-only, no dependencies. Toggle it in **Settings**.
+- **Stale readings** — Codex windows come from its newest session log, so if you haven't
+  run Codex in a while the numbers are old. When the latest snapshot is older than 30
+  minutes the ring is **dimmed** and the dropdown marks it `stale (… old)`, so an
+  outdated value never reads as live.
 
 ## Claude windows (opt-in)
 
