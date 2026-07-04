@@ -16,6 +16,12 @@ Two compact gauges show the selected rate-limit window for Codex and Claude. The
 dropdown shows both 5h and weekly windows, reset countdowns, Claude spend, and a few
 settings.
 
+![Usage Bar compact ring gauges in the macOS menu bar](docs/usage-bar-menubar-ring.png)
+
+Open the dropdown for spend, reset countdowns, projections, and settings:
+
+![Usage Bar dropdown showing Claude and Codex usage windows](docs/usage-bar-dropdown.png)
+
 ## Why This Exists
 
 There are more complete AI usage trackers. This one is deliberately smaller:
@@ -103,6 +109,12 @@ The dropdown has a **Settings** section with direct-select options:
 - **Notify near cap**: off, 80%, 90%, or 95%
 
 Settings persist in `~/.config/usage-bar/config.json`.
+
+Some menu-bar styles:
+
+![Usage Bar number style](docs/usage-bar-menubar-number.png)
+
+![Usage Bar text style](docs/usage-bar-menubar-text.png)
 
 ## Limitations
 
