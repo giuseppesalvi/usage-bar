@@ -1,115 +1,123 @@
 # Usage Bar
 
-A minimal macOS menu-bar widget that shows **Claude Code** and **Codex** usage at a
-glance: how close you are to your **rate-limit windows** (5h / weekly, with reset
-countdowns) and today's Claude spend.
+A tiny macOS menu-bar pressure gauge for **Claude Code** and **Codex** usage.
+
+Usage Bar is intentionally boring: one stdlib-only Python script, hosted by
+[SwiftBar](https://github.com/swiftbar/SwiftBar), reading local logs by default. It
+exists for people who want a quick answer to one question:
+
+> Am I close to a usage limit, and should I slow down?
 
 ```
-[C 100]  [A 7]   $95
+[C 38]  [A 46]  $25
 ```
 
-Two ring gauges (C = Codex, A = Claude) show each tool's 5-hour window filling up,
-colored green → amber → red as you approach the cap. The dropdown breaks out both
-windows for both tools, reset times, and per-model spend.
+Two compact gauges show the selected rate-limit window for Codex and Claude. The
+dropdown shows both 5h and weekly windows, reset countdowns, Claude spend, and a few
+settings.
 
-It's a single stdlib-only Python script (`usage.py`) hosted by
-[SwiftBar](https://github.com/swiftbar/SwiftBar). No dependencies, no build step.
+## Why This Exists
 
-## How it reads your data
+There are more complete AI usage trackers. This one is deliberately smaller:
 
-- **Codex** — rate-limit windows are read from the local session logs
-  (`~/.codex/sessions/**/rollout-*.jsonl`). No network.
-- **Claude spend** — token usage is summed from the local logs
-  (`~/.claude/projects/**/*.jsonl`) and priced locally. No network.
-- **Claude rate-limit windows** — *opt-in only.* Claude doesn't store its 5h/weekly
-  utilization locally, so this feature reuses the OAuth token Claude Code already keeps
-  on your machine to call Anthropic's usage endpoint **for your own account**. It is
-  **off by default**; enabling it prints a disclosure and records your acceptance.
-  See [Claude windows (opt-in)](#claude-windows-opt-in).
+- one Python file
+- no Python dependencies
+- no background daemon
+- no app bundle
+- local logs by default
+- explicit opt-in for the one networked Claude rate-limit lookup
+- focused on the few numbers that affect whether you keep working now
 
-Your token is never stored, printed, or committed — it's read into memory at run time
-and sent only to `api.anthropic.com`.
+If you want dashboards, history, sync, or a native app, this is probably not the right
+tool. If you want an inspectable SwiftBar widget that does one job well, it is.
+
+## Privacy Model
+
+- **Codex windows** are read from local session logs:
+  `~/.codex/sessions/**/rollout-*.jsonl`.
+- **Claude spend** is computed from local Claude Code logs:
+  `~/.claude/projects/**/*.jsonl`.
+- **Claude windows** are off by default. If enabled, Usage Bar reads the OAuth token
+  Claude Code already stores on your machine and calls Anthropic's usage endpoint for
+  your own account.
+
+The Claude token is read into memory at run time. It is not printed, cached, or stored
+by this project. See [PRIVACY.md](PRIVACY.md) for the full disclosure.
 
 ## Requirements
 
 - macOS
 - [SwiftBar](https://github.com/swiftbar/SwiftBar): `brew install --cask swiftbar`
-- `python3` (the system `/usr/bin/python3` is fine)
+- Python 3.10+ (`/usr/bin/python3` is fine if it is 3.10 or newer)
 
 ## Install
 
 ```sh
 git clone <this repo> ~/Documents/Projects/usage-bar
+cd ~/Documents/Projects/usage-bar
 
-# point SwiftBar at a plugin folder and symlink the plugin in
 PLUGDIR="$HOME/Library/Application Support/SwiftBar/Plugins"
 mkdir -p "$PLUGDIR"
 ln -s "$PWD/usage-bar.30s.sh" "$PLUGDIR/usage-bar.30s.sh"
 ```
 
-Launch SwiftBar and set its **Plugin Folder** to that directory (macOS may ask you to
-pick it via the panel). The widget refreshes every 30s.
+Launch SwiftBar and set its **Plugin Folder** to that directory if needed. The widget
+refreshes every 30 seconds.
 
 ## CLI
-
-`usage.py` also runs standalone:
 
 ```sh
 python3 usage.py            # one-line summary
 python3 usage.py --full     # per-window + per-model breakdown
 python3 usage.py --json     # machine-readable
+python3 usage.py --doctor   # check local setup
+python3 usage.py --version
 ```
+
+## Claude Windows
+
+Claude does not appear to persist its 5h/weekly utilization in local logs. Usage Bar can
+fetch those windows from Anthropic's own usage endpoint, but only after you opt in:
+
+```sh
+python3 usage.py --enable-claude
+python3 usage.py --disable-claude
+```
+
+Enabling prints a disclosure and records acceptance in
+`~/.config/usage-bar/config.json`. Results are cached for 120 seconds in
+`~/.config/usage-bar/claude-usage-cache.json`.
+
+This endpoint is undocumented and may change. If it breaks, Usage Bar fails closed and
+Claude falls back to spend-only.
 
 ## Customize
 
-The dropdown has a **Settings** section — each option is a small submenu of radio
-choices, so one click sets the exact value (no restart, no config editing). macOS always
-closes a menu-bar dropdown on any click, so direct-select beats cycling.
+The dropdown has a **Settings** section with direct-select options:
 
-- **Style** — `ring` (drawn gauge, % inside) · `bar` (slim fill bar + big %) ·
-  `number` (just a big %) · `harvey` (○◔◑◕● glyphs) · `text` (plain %).
-- **Tool mark** — how each tool is labelled in the drawn styles: `letter` (C / A) or
-  `logo` (small drawn symbols — OpenAI blossom for Codex, Anthropic A for Claude).
-- **Tools** — show/hide Codex or Claude in the menu bar.
-- **Bar windows** — show the 5h and/or weekly window in the bar (the dropdown always
-  shows both).
-- **Spend** — hidden, or the range shown in the bar: today · 7d · 30d.
-- **Notify near cap** — off, or the threshold (80 / 90 / 95%).
+- **Style**: `ring`, `bar`, `number`, `harvey`, or `text`
+- **Tool mark**: `letter`, `logo`, or `spark`
+- **Tools**: show/hide Codex or Claude in the menu bar
+- **Bar windows**: show 5h and/or weekly in the bar
+- **Spend**: hidden, today, 7d, or 30d
+- **Notify near cap**: off, 80%, 90%, or 95%
 
-Settings persist in `~/.config/usage-bar/config.json`. The same actions are available as
-flags (`--set-display style bar`, `--set-display mark logo`, `--toggle-tool codex`,
-`--toggle-window weekly`, `--set-spend d7`, `--set-notify 90`).
+Settings persist in `~/.config/usage-bar/config.json`.
 
-The dropdown also shows **multi-range spend** (today / 7d / 30d) and a **burn-rate
-projection** per window — e.g. "≈cap in 1h51m" or "proj 84%" — computed from the current
-fill, the window length, and the reset time.
+## Limitations
 
-## Alerts & staleness
+- macOS only.
+- Requires SwiftBar or xbar.
+- Claude rate-limit windows use an undocumented endpoint.
+- Pricing is a local hardcoded table and can drift.
+- Local logs mean this is a single-machine view.
+- This is a menu-bar indicator, not a full analytics app.
 
-- **Near-cap notifications** — when any window crosses the threshold (default 90%), a
-  native macOS banner fires *once* per window per reset cycle (no nagging; a new cycle
-  re-arms it). Local-only, no dependencies. Toggle it in **Settings**.
-- **Stale readings** — Codex windows come from its newest session log, so if you haven't
-  run Codex in a while the numbers are old. When the latest snapshot is older than 30
-  minutes the ring is **dimmed** and the dropdown marks it `stale (… old)`, so an
-  outdated value never reads as live.
-
-## Claude windows (opt-in)
+## Development
 
 ```sh
-python3 usage.py --enable-claude    # prints a disclosure, records acceptance
-python3 usage.py --disable-claude   # turn back off
+python3 -m py_compile usage.py
+python3 -m unittest discover -s tests
 ```
 
-Notes:
-- Reads the OAuth access token Claude Code stored (macOS Keychain item
-  `Claude Code-credentials`, or `~/.claude/.credentials.json`).
-- Sends it only to `https://api.anthropic.com/api/oauth/usage` to fetch your own usage.
-- This is an **undocumented** endpoint — it may change or break on a Claude Code update.
-  The feature fails closed (Claude falls back to spend-only).
-- Results are cached locally for 120s. Your acceptance is recorded in
-  `~/.config/usage-bar/config.json`.
-
-## License
-
-Personal project. No license granted yet.
+The test suite uses temporary log fixtures and does not need real Claude/Codex data.
