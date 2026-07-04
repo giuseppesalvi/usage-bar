@@ -1,26 +1,35 @@
 #!/usr/bin/env python3
-"""Usage Bar v0 — Claude Code + Codex usage at a glance.
+"""Usage Bar — Claude Code + Codex usage pressure in the macOS menu bar.
 
-Reads local logs only (no network):
-  - Claude: ~/.claude/projects/**/*.jsonl  -> today's token spend in $
-  - Codex:  ~/.codex/sessions/**/rollout-*.jsonl -> live rate-limit windows
+Local by default:
+  - Claude: ~/.claude/projects/**/*.jsonl -> token spend
+  - Codex:  ~/.codex/sessions/**/rollout-*.jsonl -> rate-limit windows
 
-Output (default): one line for a menu bar.
-  🟣 Claude $4.20 · 🟢 Codex 5h 12% · wk 41%
+Claude rate-limit windows are optional because they require Claude Code's
+stored OAuth token and an Anthropic usage endpoint request.
 
 Flags:
   --full   multi-line breakdown (per-window resets, today's tokens)
   --json   machine-readable dump
+  --doctor setup checks
 """
 from __future__ import annotations
 
+import base64
 import json
+import math
 import os
+import struct
+import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
+import zlib
 from datetime import datetime, timezone
 from pathlib import Path
 
+VERSION = "0.1.0"
 HOME = Path.home()
 CLAUDE_PROJECTS = HOME / ".claude" / "projects"
 CODEX_SESSIONS = HOME / ".codex" / "sessions"
@@ -114,7 +123,7 @@ def set_claude_enabled(on: bool) -> None:
 # ── Display customization (editable live from the dropdown) ──
 DISPLAY_DEFAULTS = {
     "style": "ring",                 # ring | bar | number | harvey | text
-    "mark": "letter",                # letter (C/A) | logo (drawn symbol)
+    "mark": "spark",                 # letter (C/A) | logo | spark (Claude starburst)
     "tools": ["codex", "claude"],    # which tools appear in the menu bar
     "windows": ["5h"],               # which windows in the bar: 5h and/or weekly
     "show_spend": True,
@@ -122,7 +131,7 @@ DISPLAY_DEFAULTS = {
 }
 _DISPLAY_CHOICES = {
     "style": ["ring", "bar", "number", "harvey", "text"],
-    "mark": ["letter", "logo"],
+    "mark": ["letter", "logo", "spark"],
     "spend_range": ["today", "d7", "d30"],
 }
 _IMAGE_STYLES = ("ring", "bar", "number")
@@ -355,7 +364,7 @@ def _price(a: dict) -> float:
     ) / 1_000_000
 
 
-def claude_spend() -> dict:
+def claude_spend(projects_dir: Path | None = None) -> dict:
     """Price Claude token usage over today / last 7d / last 30d, with today's
     per-model breakdown. Dedup: one record per (message.id, requestId), keeping
     the max-output line (streaming snapshots grow output; resumes copy lines)."""
@@ -369,11 +378,12 @@ def claude_spend() -> dict:
     best: dict[tuple, dict] = {}
     unkeyed: list[dict] = []
     dup_count = 0
-    if not CLAUDE_PROJECTS.exists():
+    projects_dir = projects_dir or CLAUDE_PROJECTS
+    if not projects_dir.exists():
         return {"found": False, "cost": 0.0, "models": {},
                 "spend": {"today": 0.0, "d7": 0.0, "d30": 0.0}}
 
-    for jf in CLAUDE_PROJECTS.rglob("*.jsonl"):
+    for jf in projects_dir.rglob("*.jsonl"):
         try:
             with jf.open("r", encoding="utf-8", errors="ignore") as fh:
                 for line in fh:
@@ -448,12 +458,13 @@ def claude_spend() -> dict:
     }
 
 
-def codex_rate_limits(scan: int = 12) -> dict:
+def codex_rate_limits(scan: int = 12, sessions_dir: Path | None = None) -> dict:
     """Latest rate-limit snapshot across the most recently modified Codex sessions."""
-    if not CODEX_SESSIONS.exists():
+    sessions_dir = sessions_dir or CODEX_SESSIONS
+    if not sessions_dir.exists():
         return {"found": False}
     files = sorted(
-        CODEX_SESSIONS.rglob("rollout-*.jsonl"),
+        sessions_dir.rglob("rollout-*.jsonl"),
         key=lambda p: p.stat().st_mtime if p.exists() else 0,
         reverse=True,
     )[:scan]
@@ -602,29 +613,22 @@ def _pct_color(pct: float) -> str:
     return "#2ecc71"
 
 
-_MENU_TEXT = "#1f2933"
-_MENU_MUTED = "#5f6670"
+# Dropdown colors as "light,dark" pairs — SwiftBar picks per appearance.
+_MENU_TEXT = "#1f2933,#e5e7eb"
+_MENU_MUTED = "#6b7280,#9ca3af"
+_MENU_ERR = "#c2410c,#fb923c"
 
 
 def _menu_pct_color(pct: float) -> str:
-    """Darker threshold colors for the translucent macOS dropdown."""
+    """Threshold colors readable on both the light and dark dropdown."""
     if pct >= 90:
-        return "#b91c1c"
+        return "#b91c1c,#f87171"
     if pct >= 70:
-        return "#b45309"
-    return "#15803d"
+        return "#b45309,#fbbf24"
+    return "#15803d,#4ade80"
 
 
 # ── Ring gauge: an anti-aliased PNG progress ring, drawn with stdlib only ──
-import base64
-import math
-import struct
-import subprocess
-import urllib.error
-import urllib.request
-import zlib
-
-
 def _hex_rgb(h: str) -> tuple[float, float, float]:
     h = h.lstrip("#")
     return (int(h[0:2], 16) / 255, int(h[2:4], 16) / 255, int(h[4:6], 16) / 255)
@@ -697,11 +701,11 @@ def _blit(out: bytearray, W: int, H: int, text: str, cx: float, cy: float,
         x += cw + gap
 
 
-# 30×30 logo bitmaps derived from the source SVG silhouettes and rendered as
-# monochrome pixels so SwiftBar can keep using a single generated PNG.
+# 30×30 logo bitmaps rasterized from the Simple Icons SVG paths with 8×8
+# supersampling; each char is a hex alpha level (0 transparent … f opaque) so
+# the marks render anti-aliased like the ring, in a single generated PNG.
 _LOGO = {
-    # Claude/Anthropic: Simple Icons "Anthropic" mark. The Claude spark loses
-    # too much detail at 30 px; the Anthropic A remains legible and clean.
+    # Claude/Anthropic: Simple Icons "Anthropic" A mark.
     "claude": (
         "000000000000000000000000000000",
         "000000000000000000000000000000",
@@ -709,25 +713,24 @@ _LOGO = {
         "000000000000000000000000000000",
         "000000000000000000000000000000",
         "000000000000000000000000000000",
-        "000000000000000000000000000000",
-        "000000000111110001111000000000",
-        "000000000111110001111000000000",
-        "000000001111110000111100000000",
-        "000000001111111000111100000000",
-        "000000011111111000011110000000",
-        "000000011111111100011110000000",
-        "000000011111111100011110000000",
-        "000000111111111100001111000000",
-        "000000111111111110001111000000",
-        "000001111111111110000111100000",
-        "000001111111111111000111100000",
-        "000001111111111111000111100000",
-        "000011111111111111000011110000",
-        "000011111111111111100011110000",
-        "000111110000000111100001111000",
-        "000111100000000011110001111000",
-        "000111100000000011110001111000",
-        "001111000000000011110000111100",
+        "000000000022210012220000000000",
+        "0000000005fffd003fff5000000000",
+        "000000000bffff300cffb000000000",
+        "000000002fffff9006fff200000000",
+        "000000008ffffff101eff800000000",
+        "00000000dffafff6009ffd00000000",
+        "00000004fff3affc003fff40000000",
+        "0000000bffc04fff300cffb0000000",
+        "0000002fff600dff9006fff2000000",
+        "0000008fff1008ffe101fff8000000",
+        "000000dffb4446fff6009ffd000000",
+        "000004fffffffffffc004fff400000",
+        "00000affffffffffff300dffa00000",
+        "00001fffcbbbbbbeff9007fff10000",
+        "00007fff20000009ffe001fff70000",
+        "0000dffb00000003fff600affd0000",
+        "0004fff500000000cffc004fff4000",
+        "000122200000000012220002221000",
         "000000000000000000000000000000",
         "000000000000000000000000000000",
         "000000000000000000000000000000",
@@ -741,28 +744,61 @@ _LOGO = {
         "000000000000000000000000000000",
         "000000000000000000000000000000",
         "000000000000000000000000000000",
-        "000000000000111000000000000000",
-        "000000000011111110000000000000",
-        "000000000110000111111100000000",
-        "000000000100001110000110000000",
-        "000000001100111000000011000000",
-        "000000111001100001110011000000",
-        "000001101001100111111001000000",
-        "000001001001111110001111000000",
-        "000001001001110011000011000000",
-        "000001001001100001110001100000",
-        "000001001101100001111100110000",
-        "000001001111100001101100110000",
-        "000001100011100001100100110000",
-        "000000110000110011100100110000",
-        "000000111100011111100100100000",
-        "000000100111111001100101100000",
-        "000000100011100001100111000000",
-        "000000110000000111001100000000",
-        "000000011000011100011000000000",
-        "000000001111111000011000000000",
-        "000000000000011111110000000000",
-        "000000000000000111000000000000",
+        "000000000007cffb50000000000000",
+        "0000000001cfa88cf9442000000000",
+        "000000000ce30001dffffb30000000",
+        "000000005f50007ee8336de4000000",
+        "0000004cfd004df9100001cd000000",
+        "000006fccb05fb3005a3002f600000",
+        "00002fa09b06a003ccdf910ca00000",
+        "00008e109b06919f7008fe6bb00000",
+        "0000ca009b06de88e7002aff800000",
+        "0000d9009b06c2002cd5004ec00000",
+        "0000bc009c069000099cb204f50000",
+        "00005f402bd990000960cb00cb0000",
+        "00000ce4004dc2002c60bb009d0000",
+        "000008ffa2007e88ed60bb00ac0000",
+        "00000bb6ef8107f91960bb01e80000",
+        "00000ac019fdcc300a60bb0af20000",
+        "000006f3002a5003bf50bdcf500000",
+        "000000dc1000019fd400dfc4000000",
+        "0000004ed6338ee70004f500000000",
+        "00000003bffffd10003ec000000000",
+        "0000000001449fc88afc1000000000",
+        "00000000000005bffc700000000000",
+        "000000000000000000000000000000",
+        "000000000000000000000000000000",
+        "000000000000000000000000000000",
+        "000000000000000000000000000000",
+    ),
+    # Claude spark: Simple Icons "Claude" starburst, alternative Claude mark.
+    "spark": (
+        "000000000000000000000000000000",
+        "000000000000000000000000000000",
+        "000000000000000000000000000000",
+        "000000000000000000000000000000",
+        "0000000007e6000064000000000000",
+        "000000000dfd0001fc000000000000",
+        "0000000008ff5004fa000740000000",
+        "0000000001dfc005f700afe0000000",
+        "000002c9005ff406f408ffb0000000",
+        "000003ffc20bfc08f15ffe20000000",
+        "0000005efe53ff59e3eff400000000",
+        "00000002bff9afcbcdff8000000000",
+        "0000000006effffefffc0001430000",
+        "00000000002bfffffff88beffc0000",
+        "0000aba98864bfffffffffc9620000",
+        "0000599abbbdefffffe94000000000",
+        "000000000003bfffffdefffed50000",
+        "00000000019fdcffffe337aefc0000",
+        "000000007ef95fafeffe4000200000",
+        "0000002cfd42eb5e6fcae500000000",
+        "0000009f810ce18d0cf68f50000000",
+        "00000011009f40bb02fe25e6000000",
+        "0000000006f800ea007fb024000000",
+        "000000001f8002f8000bf000000000",
+        "00000000040005f700013000000000",
+        "00000000000002d400000000000000",
         "000000000000000000000000000000",
         "000000000000000000000000000000",
         "000000000000000000000000000000",
@@ -772,17 +808,29 @@ _LOGO = {
 _TAG_TOOL = {"C": "codex", "A": "claude"}
 
 
+def _logo_rows(tag: str, mark: str) -> tuple[str, ...] | None:
+    """Bitmap for a tool mark, or None for letter mode. The "spark" mark swaps
+    the Anthropic A for the Claude starburst; Codex keeps the blossom."""
+    tool = _TAG_TOOL.get(tag)
+    if not tool or mark not in ("logo", "spark"):
+        return None
+    if mark == "spark" and tool == "claude":
+        return _LOGO["spark"]
+    return _LOGO.get(tool)
+
+
 def _blit_rows(out: bytearray, W: int, H: int, rows: tuple[str, ...],
                cx: float, cy: float, scale: int, rgb: tuple[float, float, float]) -> None:
-    """Draw a bitmap (rows of '0'/'1') centered on (cx, cy) into an RGBA buffer."""
+    """Draw an alpha bitmap (rows of hex levels 0…f) centered on (cx, cy)."""
     gh, gw = len(rows), len(rows[0])
     x0 = int(round(cx - gw * scale / 2))
     y0 = int(round(cy - gh * scale / 2))
     r, g, b = int(rgb[0] * 255), int(rgb[1] * 255), int(rgb[2] * 255)
     for ry, row in enumerate(rows):
         for rx, ch in enumerate(row):
-            if ch != "1":
+            if ch == "0":
                 continue
+            a = int(ch, 16) * 255 // 15
             for yy in range(scale):
                 py = y0 + ry * scale + yy
                 if not 0 <= py < H:
@@ -791,11 +839,12 @@ def _blit_rows(out: bytearray, W: int, H: int, rows: tuple[str, ...],
                     px = x0 + rx * scale + xx
                     if 0 <= px < W:
                         i = (py * W + px) * 4
-                        out[i], out[i + 1], out[i + 2], out[i + 3] = r, g, b, 255
+                        out[i], out[i + 1], out[i + 2] = r, g, b
+                        out[i + 3] = max(out[i + 3], a)
 
 
 def _mark_w(tag: str, mark: str, scale: int) -> int:
-    rows = _LOGO.get(_TAG_TOOL.get(tag)) if mark == "logo" else None
+    rows = _logo_rows(tag, mark)
     if rows:
         return len(rows[0])
     return 3 * scale
@@ -805,7 +854,7 @@ def _rows_ink_center(rows: tuple[str, ...]) -> tuple[float, float]:
     xs, ys = [], []
     for y, row in enumerate(rows):
         for x, ch in enumerate(row):
-            if ch == "1":
+            if ch != "0":
                 xs.append(x)
                 ys.append(y)
     if not xs:
@@ -816,8 +865,8 @@ def _rows_ink_center(rows: tuple[str, ...]) -> tuple[float, float]:
 def _draw_mark(out: bytearray, W: int, H: int, tag: str, mark: str,
                cx: float, cy: float, scale: int, rgb: tuple[float, float, float]) -> None:
     """Draw the tool identifier: a C/A letter, or the drawn logo symbol."""
-    if mark == "logo":
-        rows = _LOGO.get(_TAG_TOOL.get(tag))
+    if mark != "letter":
+        rows = _logo_rows(tag, mark)
         if rows:
             ix, iy = _rows_ink_center(rows)
             cx += len(rows[0]) / 2 - ix
@@ -857,7 +906,7 @@ def _ring_rgba(pct: float, rgb: tuple[float, float, float], size: int, ss: int =
     frac = max(0.0, min(1.0, pct / 100.0))
     sw = sh = size * ss
     cx = cy = sw / 2.0
-    r_out = sw * 0.46
+    r_out = sw * 0.43  # slightly inset so the gauge sits lighter among menu icons
     r_in = r_out - sw * 0.10  # thin Apple-style stroke
     track = (0.55, 0.55, 0.58)
     track_a = 0.34
@@ -1145,7 +1194,7 @@ def swiftbar_output(claude: dict, codex: dict, cw: dict) -> str:
             f"| font=Menlo size=12 color={_MENU_TEXT}"
         )
         for model, a in sorted(claude["models"].items(), key=lambda kv: -kv[1]["cost"]):
-            lines.append(f"  {model}: ${a['cost']:.2f} today | font=Menlo size=11 color={_MENU_TEXT}")
+            lines.append(f"  {model}: ${a['cost']:.2f} today | font=Menlo size=11 color={_MENU_MUTED}")
         if claude.get("dups_skipped"):
             lines.append(f"  {claude['dups_skipped']:,} duplicate lines skipped | size=10 color={_MENU_MUTED}")
     else:
@@ -1166,7 +1215,7 @@ def swiftbar_output(claude: dict, codex: dict, cw: dict) -> str:
                 lines.append(_window_line(label, w, wmin))
         lines.append(click("Disable Claude windows", "--disable-claude"))
     else:
-        lines.append(f"{cw.get('error', 'unavailable')} | size=11 color=#e67e22")
+        lines.append(f"{cw.get('error', 'unavailable')} | size=11 color={_MENU_ERR}")
 
     # ── Codex windows ──
     lines.append("---")
@@ -1184,22 +1233,24 @@ def swiftbar_output(claude: dict, codex: dict, cw: dict) -> str:
     else:
         lines.append(f"no rate-limit data | size=11 color={_MENU_MUTED}")
 
-    # ── Settings — each is a submenu of radio choices; one click sets the value
-    #    (macOS always closes the menu on any click, so direct-select beats cycling).
+    # ── Settings — one submenu; each choice is a direct-select radio.
+    #    (macOS closes any menu on click — NSMenu behavior SwiftBar can't
+    #    override — so every item applies and refreshes in a single click.)
     lines.append("---")
-    lines.append(f"Settings | size=11 color={_MENU_MUTED}")
+    lines.append("Settings")
 
     def radio(title: str, cur: str, options, *set_args: str) -> None:
-        lines.append(f"{title}: {cur} | size=12 color={_MENU_TEXT}")
+        lines.append(f"-- {title}: {cur}")
         for lbl, val in options:
             dot = "●" if cur == val else "○"
-            lines.append("-- " + click(f"{dot} {lbl}", *set_args, val))
+            lines.append("---- " + click(f"{dot} {lbl}", *set_args, val))
 
     radio("Style", disp["style"], [(s, s) for s in _DISPLAY_CHOICES["style"]],
           "--set-display", "style")
     mark = disp.get("mark", "letter")
     radio("Tool mark", mark,
-          [("letter — C / A", "letter"), ("logo — drawn symbols", "logo")],
+          [("letter — C / A", "letter"), ("logo — blossom / A", "logo"),
+           ("spark — blossom / Claude spark", "spark")],
           "--set-display", "mark")
     cur_spend = disp["spend_range"] if disp["show_spend"] else "hidden"
     radio("Spend in bar", cur_spend,
@@ -1207,11 +1258,13 @@ def swiftbar_output(claude: dict, codex: dict, cw: dict) -> str:
           "--set-spend")
 
     for t in ("codex", "claude"):
-        lines.append(click(f"Tool {labels[t]}: {'✓ shown' if t in disp['tools'] else '✗ hidden'}",
-                           "--toggle-tool", t))
+        lines.append("-- " + click(
+            f"Tool {labels[t]}: {'✓ shown' if t in disp['tools'] else '✗ hidden'}",
+            "--toggle-tool", t))
     for wk in ("5h", "weekly"):
-        lines.append(click(f"Bar window {wk}: {'✓' if wk in disp['windows'] else '✗'}",
-                           "--toggle-window", wk))
+        lines.append("-- " + click(
+            f"Bar window {wk}: {'✓' if wk in disp['windows'] else '✗'}",
+            "--toggle-window", wk))
 
     ncfg = notify_cfg()
     ncur = f"≥{int(ncfg['threshold'])}%" if ncfg["enabled"] else "off"
@@ -1224,7 +1277,58 @@ def swiftbar_output(claude: dict, codex: dict, cw: dict) -> str:
     return "\n".join(lines)
 
 
+def _arg_value(argv: list[str], flag: str, count: int = 1) -> list[str] | None:
+    """Return values after a flag, or None if the command is malformed."""
+    if flag not in argv:
+        return None
+    i = argv.index(flag) + 1
+    vals = argv[i:i + count]
+    if len(vals) != count or any(v.startswith("--") for v in vals):
+        print(f"Usage Bar: {flag} expects {count} value(s)", file=sys.stderr)
+        return None
+    return vals
+
+
+def doctor_report() -> str:
+    """Human-readable setup diagnostics. No network requests."""
+    lines = [f"Usage Bar {VERSION} doctor", ""]
+
+    def check(label: str, ok: bool, detail: str) -> None:
+        mark = "ok" if ok else "missing"
+        lines.append(f"{mark:7} {label}: {detail}")
+
+    check("python", sys.version_info >= (3, 10), sys.version.split()[0])
+    check("script", Path(__file__).exists(), str(Path(__file__).resolve()))
+    check("config", CONFIG_FILE.exists(), str(CONFIG_FILE))
+    check("codex logs", CODEX_SESSIONS.exists(), str(CODEX_SESSIONS))
+    check("claude logs", CLAUDE_PROJECTS.exists(), str(CLAUDE_PROJECTS))
+    check("claude windows", claude_enabled(), "enabled" if claude_enabled() else "disabled")
+
+    plugin = HOME / "Library" / "Application Support" / "SwiftBar" / "Plugins" / "usage-bar.30s.sh"
+    if plugin.exists():
+        detail = str(plugin)
+        try:
+            if plugin.is_symlink():
+                detail += f" -> {plugin.resolve()}"
+        except OSError:
+            pass
+        check("swiftbar plugin", True, detail)
+    else:
+        check("swiftbar plugin", False, str(plugin))
+
+    readable = os.access(Path(__file__), os.R_OK)
+    check("readable", readable, "usage.py" if readable else "usage.py is not readable")
+    return "\n".join(lines)
+
+
 def main(argv: list[str]) -> int:
+    if "--version" in argv:
+        print(VERSION)
+        return 0
+    if "--doctor" in argv:
+        print(doctor_report())
+        return 0
+
     # Consent management for the Claude-windows feature.
     if "--enable-claude" in argv:
         print(CLAUDE_CONSENT_TEXT)
@@ -1246,10 +1350,16 @@ def main(argv: list[str]) -> int:
         toggle_display_bool("show_spend")
         return 0
     if "--toggle-tool" in argv:
-        toggle_display_list("tools", argv[argv.index("--toggle-tool") + 1])
+        vals = _arg_value(argv, "--toggle-tool")
+        if vals is None:
+            return 2
+        toggle_display_list("tools", vals[0])
         return 0
     if "--toggle-window" in argv:
-        toggle_display_list("windows", argv[argv.index("--toggle-window") + 1])
+        vals = _arg_value(argv, "--toggle-window")
+        if vals is None:
+            return 2
+        toggle_display_list("windows", vals[0])
         return 0
     if "--toggle-notify" in argv:
         cfg = _load_config()
@@ -1266,13 +1376,18 @@ def main(argv: list[str]) -> int:
         return 0
     # Direct-select handlers used by the radio submenus (also usable by hand).
     if "--set-display" in argv:
-        i = argv.index("--set-display")
-        key, val = argv[i + 1], argv[i + 2]
+        vals = _arg_value(argv, "--set-display", 2)
+        if vals is None:
+            return 2
+        key, val = vals
         if val in _DISPLAY_CHOICES.get(key, []):
             set_display(key, val)
         return 0
     if "--set-spend" in argv:
-        v = argv[argv.index("--set-spend") + 1]
+        vals = _arg_value(argv, "--set-spend")
+        if vals is None:
+            return 2
+        v = vals[0]
         if v == "hidden":
             set_display("show_spend", False)
         elif v in _DISPLAY_CHOICES["spend_range"]:
@@ -1280,7 +1395,10 @@ def main(argv: list[str]) -> int:
             set_display("spend_range", v)
         return 0
     if "--set-notify" in argv:
-        v = argv[argv.index("--set-notify") + 1]
+        vals = _arg_value(argv, "--set-notify")
+        if vals is None:
+            return 2
+        v = vals[0]
         cfg = _load_config()
         n = cfg.setdefault("notify", {})
         if v == "off":
