@@ -59,8 +59,8 @@ by this project. See [PRIVACY.md](PRIVACY.md) for the full disclosure.
 ## Install
 
 ```sh
-git clone <this repo> ~/Documents/Projects/usage-bar
-cd ~/Documents/Projects/usage-bar
+git clone https://github.com/giuseppesalvi/usage-bar.git
+cd usage-bar
 
 PLUGDIR="$HOME/Library/Application Support/SwiftBar/Plugins"
 mkdir -p "$PLUGDIR"
@@ -110,9 +110,15 @@ The dropdown has a **Settings** section with direct-select options:
 
 Settings persist in `~/.config/usage-bar/config.json`.
 
-Some menu-bar styles:
+Menu-bar styles, in order: `ring`, `bar`, `number`, `harvey`, `text`.
+
+![Usage Bar ring style](docs/usage-bar-menubar-ring.png)
+
+![Usage Bar bar style](docs/usage-bar-menubar-bar.png)
 
 ![Usage Bar number style](docs/usage-bar-menubar-number.png)
+
+![Usage Bar harvey style](docs/usage-bar-menubar-harvey.png)
 
 ![Usage Bar text style](docs/usage-bar-menubar-text.png)
 
