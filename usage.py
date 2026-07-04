@@ -128,11 +128,13 @@ DISPLAY_DEFAULTS = {
     "windows": ["5h"],               # which windows in the bar: 5h and/or weekly
     "show_spend": True,
     "spend_range": "today",          # today | d7 | d30
+    "digits": "large",               # digit size in number/bar styles
 }
 _DISPLAY_CHOICES = {
     "style": ["ring", "bar", "number", "harvey", "text"],
     "mark": ["letter", "logo", "spark"],
     "spend_range": ["today", "d7", "d30"],
+    "digits": ["large", "medium", "small"],
 }
 _IMAGE_STYLES = ("ring", "bar", "number")
 _DISPLAY_LISTS = {"tools": ["codex", "claude"], "windows": ["5h", "weekly"]}
@@ -701,6 +703,60 @@ def _blit(out: bytearray, W: int, H: int, text: str, cx: float, cy: float,
         x += cw + gap
 
 
+_SS = 3  # supersample factor for AA'd text and bars (matches the ring's)
+
+
+def _downsample(big: bytearray, w: int, h: int, ss: int = _SS) -> bytearray:
+    """Box-average a (w·ss)×(h·ss) RGBA buffer down to w×h, alpha-weighted."""
+    out = bytearray(w * h * 4)
+    n = ss * ss
+    sw = w * ss
+    for y in range(h):
+        for x in range(w):
+            sa = sr = sg = sb = 0
+            for yy in range(ss):
+                base = ((y * ss + yy) * sw + x * ss) * 4
+                for xx in range(ss):
+                    i = base + xx * 4
+                    a = big[i + 3]
+                    if a:
+                        sa += a
+                        sr += big[i] * a
+                        sg += big[i + 1] * a
+                        sb += big[i + 2] * a
+            if sa:
+                i = (y * w + x) * 4
+                out[i] = sr // sa
+                out[i + 1] = sg // sa
+                out[i + 2] = sb // sa
+                out[i + 3] = sa // n
+    return out
+
+
+def _text_rgba(text: str, s: int, rgb: tuple[float, float, float]) -> tuple[int, int, bytearray]:
+    """AA'd pixel-font text: glyphs drawn at subpixel scale `s` (effective
+    scale s/_SS, so fractional sizes work) then box-filtered down."""
+    sub_w = s * (4 * len(text) - 1)  # 3-wide glyph + 1 gap per char
+    sub_h = 5 * s
+    w = -(-sub_w // _SS)
+    h = -(-sub_h // _SS)
+    big = bytearray((w * _SS) * (h * _SS) * 4)
+    _blit(big, w * _SS, h * _SS, text, w * _SS / 2, h * _SS / 2, s, rgb)
+    return w, h, _downsample(big, w, h)
+
+
+def _paste(dst: bytearray, W: int, src: bytearray, sw: int, sh: int,
+           x0: int, y0: int) -> None:
+    """Copy an RGBA block into dst (row-major, width W) where src has ink."""
+    for y in range(sh):
+        for x in range(sw):
+            si = (y * sw + x) * 4
+            if not src[si + 3]:
+                continue
+            di = ((y + y0) * W + x + x0) * 4
+            dst[di:di + 4] = src[si:si + 4]
+
+
 # 30×30 logo bitmaps rasterized from the Simple Icons SVG paths with 8×8
 # supersampling; each char is a hex alpha level (0 transparent … f opaque) so
 # the marks render anti-aliased like the ring, in a single generated PNG.
@@ -843,11 +899,14 @@ def _blit_rows(out: bytearray, W: int, H: int, rows: tuple[str, ...],
                         out[i + 3] = max(out[i + 3], a)
 
 
+_LETTER_S = 7  # letter-mark subpixel scale (effective 7/3 ≈ 2.3, AA'd)
+
+
 def _mark_w(tag: str, mark: str, scale: int) -> int:
     rows = _logo_rows(tag, mark)
     if rows:
         return len(rows[0])
-    return 3 * scale
+    return -(-3 * _LETTER_S // _SS)
 
 
 def _rows_ink_center(rows: tuple[str, ...]) -> tuple[float, float]:
@@ -873,28 +932,40 @@ def _draw_mark(out: bytearray, W: int, H: int, tag: str, mark: str,
             cy += len(rows) / 2 - iy
             _blit_rows(out, W, H, rows, cx, cy, 1, rgb)
             return
-    _blit(out, W, H, tag, cx, cy, scale, rgb)
+    tw, th, tbuf = _text_rgba(tag, _LETTER_S, rgb)
+    _paste(out, W, tbuf, tw, th, int(round(cx - tw / 2)), int(round(cy - th / 2)))
 
 
-def _hbar(out: bytearray, W: int, H: int, x: int, y: int, bw: int, bh: int,
-          frac: float, rgb: tuple[float, float, float]) -> None:
-    """A slim horizontal progress bar: colored fill over a faint track."""
+def _hbar_rgba(bw: int, bh: int, frac: float,
+               rgb: tuple[float, float, float]) -> bytearray:
+    """A slim capsule progress bar (bw×bh RGBA, AA'd): rounded colored fill
+    over a faint rounded track."""
     track, ta = (0.55, 0.55, 0.58), 0.34
-    fill = int(round(bw * max(0.0, min(1.0, frac))))
-    for yy in range(bh):
-        py = y + yy
-        if not 0 <= py < H:
-            continue
-        for xx in range(bw):
-            px = x + xx
-            if not 0 <= px < W:
+    W, H = bw * _SS, bh * _SS
+    r = H / 2.0
+    fx = W * max(0.0, min(1.0, frac))
+
+    def in_capsule(px: float, dy: float, x1: float) -> bool:
+        if x1 <= 0:
+            return False
+        rr = min(r, x1 / 2)
+        cx = min(max(px, rr), x1 - rr)
+        return (px - cx) ** 2 + dy * dy <= rr * rr
+
+    big = bytearray(W * H * 4)
+    for y in range(H):
+        dy = y + 0.5 - H / 2.0
+        for x in range(W):
+            px = x + 0.5
+            if not in_capsule(px, dy, W):
                 continue
-            col, a = (rgb, 1.0) if xx < fill else (track, ta)
-            i = (py * W + px) * 4
-            out[i] = int(col[0] * 255)
-            out[i + 1] = int(col[1] * 255)
-            out[i + 2] = int(col[2] * 255)
-            out[i + 3] = int(a * 255)
+            col, a = (rgb, 1.0) if in_capsule(px, dy, fx) else (track, ta)
+            i = (y * W + x) * 4
+            big[i] = int(col[0] * 255)
+            big[i + 1] = int(col[1] * 255)
+            big[i + 2] = int(col[2] * 255)
+            big[i + 3] = int(a * 255)
+    return _downsample(big, bw, bh)
 
 
 def _ring_rgba(pct: float, rgb: tuple[float, float, float], size: int, ss: int = 3,
@@ -941,16 +1012,20 @@ def _ring_rgba(pct: float, rgb: tuple[float, float, float], size: int, ss: int =
                 out[i + 3] = int(sa / n * 255)
     fs = max(1, size // 22)
     if center:
-        # Largest font scale whose glyph block fits the (thin-ring) inner circle.
-        inner = 0.72 * size  # inner diameter in target px (r_in = 0.36 * sw)
-        cscale = fs
+        # Largest subpixel scale whose glyph block fits inside the inner circle
+        # — compare the block's diagonal (its corners reach furthest) to the
+        # hole diameter, with fractional effective scales for AA.
+        fit = 0.66 * size * 0.96  # inner hole diameter (r_in = 0.33·sw), padded
         fit_len = max(2, len(center))
-        for s in (4, 3, 2, 1):
-            gw = s * (4 * fit_len - 1)  # 3px glyph + 1px gap per char
-            if gw <= inner * 0.94 and 5 * s <= inner * 0.94:
-                cscale = s
+        best = _SS
+        for s in range(5 * _SS, _SS - 1, -1):
+            gw = s * (4 * fit_len - 1) / _SS
+            gh = 5 * s / _SS
+            if math.hypot(gw, gh) <= fit:
+                best = s
                 break
-        _blit(out, size, size, center, size / 2, size / 2, cscale, rgb)
+        tw, th, tbuf = _text_rgba(center, best, rgb)
+        _paste(out, size, tbuf, tw, th, (size - tw) // 2, (size - th) // 2)
     if top:
         _blit(out, size, size, top, size / 2, size * 0.35, fs, rgb)
     if bottom:
@@ -982,20 +1057,23 @@ def _cell_rgb(pct: float, stale: bool) -> tuple[float, float, float]:
     return rgb
 
 
-def _num_w(text: str, scale: int) -> int:
-    return len(text) * 3 * scale + (len(text) - 1) * scale  # 3px glyph + 1px gap
-
-
 def _text_cell(text: str, rgb: tuple[float, float, float], h: int = 30,
-               scale: int = 3) -> tuple[int, int, bytearray]:
-    w = _num_w(text, scale)
-    cell = bytearray(w * h * 4)
-    _blit(cell, w, h, text, w / 2, h / 2, scale, rgb)
-    return w, h, cell
+               s: int = 10) -> tuple[int, int, bytearray]:
+    tw, th, tbuf = _text_rgba(text, s, rgb)
+    cell = bytearray(tw * h * 4)
+    _paste(cell, tw, tbuf, tw, th, 0, (h - th) // 2)
+    return tw, h, cell
+
+
+# digit-size setting → subpixel text scale per style (heights ≈ 5·s/3 px)
+_DIGIT_S = {
+    "number": {"large": 13, "medium": 11, "small": 9},
+    "bar": {"large": 11, "medium": 9, "small": 8},
+}
 
 
 def _gauge_cell(tag: str, pct: float, mark: str = "letter", ring: int = 30,
-                stale: bool = False) -> tuple[int, int, bytearray]:
+                stale: bool = False, digits: str = "large") -> tuple[int, int, bytearray]:
     """Ring style: the tool mark (letter/logo) left, a ring with % centered inside."""
     rgb = _cell_rgb(pct, stale)
     ring_buf = _ring_rgba(pct, rgb, ring, center=f"{pct:.0f}")
@@ -1013,37 +1091,37 @@ def _gauge_cell(tag: str, pct: float, mark: str = "letter", ring: int = 30,
 
 
 def _number_cell(tag: str, pct: float, mark: str = "letter", h: int = 30,
-                 stale: bool = False) -> tuple[int, int, bytearray]:
+                 stale: bool = False, digits: str = "large") -> tuple[int, int, bytearray]:
     """Number style: the tool mark left, a big threshold-colored % right. No ring."""
     rgb = _cell_rgb(pct, stale)
-    num = f"{pct:.0f}"
-    nscale = 5
-    num_w = _num_w(num, nscale)
+    # large (s=13) ≈ 22px digits — the cap height of 13pt menu-bar text
+    s = _DIGIT_S["number"].get(digits, 13)
+    tw, th, tbuf = _text_rgba(f"{pct:.0f}", s, rgb)
     mark_w = _mark_w(tag, mark, _MARK_SCALE)
     gap = 4
-    w = mark_w + gap + num_w
+    w = mark_w + gap + tw
     cell = bytearray(w * h * 4)
     _draw_mark(cell, w, h, tag, mark, mark_w / 2, h / 2, _MARK_SCALE, rgb)
-    _blit(cell, w, h, num, mark_w + gap + num_w / 2, h / 2, nscale, rgb)
+    _paste(cell, w, tbuf, tw, th, mark_w + gap, (h - th) // 2)
     return w, h, cell
 
 
 def _bar_cell(tag: str, pct: float, mark: str = "letter", h: int = 30,
-              stale: bool = False) -> tuple[int, int, bytearray]:
-    """Bar style: the tool mark, a slim horizontal fill bar, then a big %."""
+              stale: bool = False, digits: str = "large") -> tuple[int, int, bytearray]:
+    """Bar style: the tool mark, a slim capsule fill bar, then the %."""
     rgb = _cell_rgb(pct, stale)
-    num = f"{pct:.0f}"
-    nscale = 4
-    num_w = _num_w(num, nscale)
-    bar_w, bar_h = 40, 8
+    s = _DIGIT_S["bar"].get(digits, 11)
+    tw, th, tbuf = _text_rgba(f"{pct:.0f}", s, rgb)
+    bar_w, bar_h = 36, 7
     mark_w = _mark_w(tag, mark, _MARK_SCALE)
     gap = 4
-    w = mark_w + gap + bar_w + gap + num_w
+    w = mark_w + gap + bar_w + gap + tw
     cell = bytearray(w * h * 4)
     _draw_mark(cell, w, h, tag, mark, mark_w / 2, h / 2, _MARK_SCALE, rgb)
     bx = mark_w + gap
-    _hbar(cell, w, h, bx, (h - bar_h) // 2, bar_w, bar_h, pct / 100.0, rgb)
-    _blit(cell, w, h, num, bx + bar_w + gap + num_w / 2, h / 2, nscale, rgb)
+    _paste(cell, w, _hbar_rgba(bar_w, bar_h, pct / 100.0, rgb), bar_w, bar_h,
+           bx, (h - bar_h) // 2)
+    _paste(cell, w, tbuf, tw, th, bx + bar_w + gap, (h - th) // 2)
     return w, h, cell
 
 
@@ -1069,13 +1147,14 @@ def _compose_cells(cells: list[tuple[int, int, bytearray]],
 
 
 def bar_image(items: list[dict], style: str = "ring", mark: str = "letter",
-              prefix: str = "") -> str | None:
+              prefix: str = "", digits: str = "large") -> str | None:
     """Base64 PNG: a row of per-tool cells in the chosen image style.
     items: [{"tag": "C", "pct": 73.0, "stale": False}, ...]"""
     build = _CELL_BUILDERS.get(style)
     if not build or not items:
         return None
-    cells = [build(it["tag"], it["pct"], mark=mark, stale=it.get("stale", False))
+    cells = [build(it["tag"], it["pct"], mark=mark, stale=it.get("stale", False),
+                   digits=digits)
              for it in items]
     if prefix:
         worst = max((it.get("pct") or 0) for it in items)
@@ -1154,7 +1233,8 @@ def swiftbar_output(claude: dict, codex: dict, cw: dict) -> str:
                  for t in active if win_pct(t, wins[0]) is not None]
         img = None
         try:
-            img = bar_image(items, disp["style"], disp.get("mark", "letter"), spend_img_txt) if items else None
+            img = bar_image(items, disp["style"], disp.get("mark", "letter"), spend_img_txt,
+                            disp.get("digits", "large")) if items else None
         except Exception:
             img = None
         if img:
@@ -1256,6 +1336,9 @@ def swiftbar_output(claude: dict, codex: dict, cw: dict) -> str:
     radio("Spend in bar", cur_spend,
           [("hidden", "hidden"), ("today", "today"), ("7d", "d7"), ("30d", "d30")],
           "--set-spend")
+    radio("Digit size (number/bar)", disp.get("digits", "large"),
+          [(d, d) for d in _DISPLAY_CHOICES["digits"]],
+          "--set-display", "digits")
 
     for t in ("codex", "claude"):
         lines.append("-- " + click(
