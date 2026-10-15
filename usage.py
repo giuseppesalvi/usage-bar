@@ -1494,7 +1494,13 @@ def main(argv: list[str]) -> int:
         _save_config(cfg)
         return 0
 
-    claude = claude_spend()
+    # Walking ~/.claude/projects costs ~1.5 s on a large history. Skip it when
+    # the spend is hidden: nothing in the rendered bar or menu reads it.
+    if "--swiftbar" in argv and not display_cfg()["show_spend"]:
+        claude = {"found": False, "cost": 0.0, "models": {},
+                  "spend": {"today": 0.0, "d7": 0.0, "d30": 0.0}}
+    else:
+        claude = claude_spend()
     codex = codex_rate_limits()
     cw = claude_windows()
     if "--json" in argv:
