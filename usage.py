@@ -22,6 +22,7 @@ import os
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -72,6 +73,8 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 CLAUDE_CACHE = CONFIG_DIR / "claude-usage-cache.json"
 CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 CLAUDE_CACHE_TTL = 120  # seconds — be polite to the endpoint
+CLAUDE_SPEND_CACHE = CONFIG_DIR / "claude-spend-cache.json"
+CLAUDE_SPEND_CACHE_TTL = 120  # seconds — amortize log scans across SwiftBar refreshes
 
 CLAUDE_CONSENT_TEXT = f"""\
 Usage Bar — enable Claude rate-limit windows
@@ -458,6 +461,48 @@ def claude_spend(projects_dir: Path | None = None) -> dict:
         "dups_skipped": dup_count,
         "spend": {"today": s_today, "d7": s7, "d30": s30},
     }
+
+
+def cached_claude_spend() -> dict:
+    """Reuse spend totals for SwiftBar; CLI reports always scan fresh logs."""
+    now = time.time()
+    today = _local_today()
+    try:
+        cached = json.loads(CLAUDE_SPEND_CACHE.read_text())
+        data = cached["data"]
+        if (cached["version"] == VERSION and cached["date"] == today
+                and 0 <= now - cached["fetched_at"] < CLAUDE_SPEND_CACHE_TTL
+                and isinstance(data["found"], bool)
+                and isinstance(data["cost"], (int, float))
+                and isinstance(data["models"], dict)
+                and all(isinstance(data["spend"][key], (int, float))
+                        for key in ("today", "d7", "d30"))
+                and all(isinstance(model["cost"], (int, float))
+                        for model in data["models"].values())):
+            return data
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+
+    data = claude_spend()
+    temporary = None
+    try:
+        CLAUDE_SPEND_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        # Atomic replacement keeps concurrent refreshes from reading partial JSON.
+        with tempfile.NamedTemporaryFile(mode="w", dir=CLAUDE_SPEND_CACHE.parent,
+                                         delete=False) as cache_file:
+            temporary = Path(cache_file.name)
+            json.dump({"version": VERSION, "date": today,
+                       "fetched_at": now, "data": data}, cache_file)
+        temporary.replace(CLAUDE_SPEND_CACHE)
+    except OSError:
+        pass  # A read-only cache must not prevent displaying fresh totals.
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+    return data
 
 
 def codex_rate_limits(scan: int = 12, sessions_dir: Path | None = None) -> dict:
@@ -1494,13 +1539,9 @@ def main(argv: list[str]) -> int:
         _save_config(cfg)
         return 0
 
-    # Walking ~/.claude/projects costs ~1.5 s on a large history. Skip it when
-    # the spend is hidden: nothing in the rendered bar or menu reads it.
-    if "--swiftbar" in argv and not display_cfg()["show_spend"]:
-        claude = {"found": False, "cost": 0.0, "models": {},
-                  "spend": {"today": 0.0, "d7": 0.0, "d30": 0.0}}
-    else:
-        claude = claude_spend()
+    # Spend remains visible in the dropdown even when hidden in the menu bar.
+    claude = (cached_claude_spend() if "--swiftbar" in argv and "--json" not in argv
+              else claude_spend())
     codex = codex_rate_limits()
     cw = claude_windows()
     if "--json" in argv:

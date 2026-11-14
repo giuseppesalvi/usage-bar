@@ -110,6 +110,10 @@ The dropdown has a **Settings** section with direct-select options:
 
 Settings persist in `~/.config/usage-bar/config.json`.
 
+SwiftBar caches Claude spend totals locally for up to 120 seconds to avoid scanning
+the log history on every refresh or menu open. Hiding spend in the bar keeps totals
+and model costs visible in the dropdown. CLI reports always read fresh logs.
+
 Menu-bar styles, in order: `ring`, `bar`, `number`, `harvey`, `text`.
 
 ![Usage Bar ring style](docs/usage-bar-menubar-ring.png)
