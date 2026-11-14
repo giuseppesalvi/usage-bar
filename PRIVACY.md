@@ -19,6 +19,9 @@ on your machine.
   `~/.config/usage-bar/config.json`
 - Claude usage cache, only when Claude windows are enabled:
   `~/.config/usage-bar/claude-usage-cache.json`
+- Claude spend cache for SwiftBar (aggregate totals and today's per-model costs,
+  refreshed after 120 seconds or a local date change):
+  `~/.config/usage-bar/claude-spend-cache.json`
 - Notification de-duplication state:
   `~/.config/usage-bar/notify-state.json`
 

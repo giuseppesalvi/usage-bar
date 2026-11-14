@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import tempfile
 import unittest
@@ -55,6 +57,82 @@ class ClaudeSpendTests(unittest.TestCase):
         self.assertFalse(result["found"])
         self.assertEqual(result["cost"], 0.0)
         self.assertEqual(result["spend"], {"today": 0.0, "d7": 0.0, "d30": 0.0})
+
+
+class ClaudeSpendCacheTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.cache = Path(self.directory.name) / "cache" / "spend.json"
+        self.data = {
+            "found": True, "cost": 1.23,
+            "models": {"fixture-model": {"cost": 1.23, "input": 10,
+                                          "output": 20, "cache_read": 0}},
+            "spend": {"today": 1.23, "d7": 4.56, "d30": 7.89},
+        }
+        for patcher in (
+            mock.patch.object(usage, "CLAUDE_SPEND_CACHE", self.cache),
+            mock.patch.object(usage, "_local_today", return_value="2026-11-14"),
+            mock.patch.object(usage.time, "time", return_value=1000),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_hidden_spend_survives_cached_swiftbar_refresh(self):
+        display = {**usage.DISPLAY_DEFAULTS, "style": "text", "show_spend": False}
+        with mock.patch.object(usage, "claude_spend", return_value=self.data) as scan, \
+             mock.patch.object(usage, "display_cfg", return_value=display), \
+             mock.patch.object(usage, "codex_rate_limits", return_value={"found": False}), \
+             mock.patch.object(usage, "claude_windows", return_value={"enabled": False}), \
+             mock.patch.object(usage, "check_notifications"), \
+             mock.patch.object(usage, "notify_cfg", return_value={"enabled": False, "threshold": 90}):
+            for _ in range(2):
+                with contextlib.redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(usage.main(["--swiftbar"]), 0)
+                title, dropdown = output.getvalue().split("\n", 1)
+                self.assertNotIn("$", title)
+                self.assertIn("today $1.23  ·  7d $4.56  ·  30d $7.89", dropdown)
+                self.assertIn("fixture-model: $1.23 today", dropdown)
+            scan.assert_called_once_with()
+
+    def test_expired_midnight_future_and_old_version_caches_refresh(self):
+        with mock.patch.object(usage, "claude_spend", return_value=self.data) as scan:
+            usage.cached_claude_spend()
+            original = json.loads(self.cache.read_text())
+            for changes in ({"fetched_at": 1000 - usage.CLAUDE_SPEND_CACHE_TTL},
+                            {"date": "2026-11-13"}, {"fetched_at": 1001},
+                            {"version": "old"}):
+                with self.subTest(changes=changes):
+                    self.cache.write_text(json.dumps({**original, **changes}))
+                    scan.reset_mock()
+                    self.assertEqual(usage.cached_claude_spend(), self.data)
+                    scan.assert_called_once_with()
+
+    def test_corrupt_caches_refresh(self):
+        self.cache.parent.mkdir()
+        for contents in ("{", "null", "[]", '{}',
+                         json.dumps({"version": usage.VERSION, "date": "2026-11-14",
+                                     "fetched_at": 1000, "data": {"found": True}})):
+            with self.subTest(contents=contents), \
+                 mock.patch.object(usage, "claude_spend", return_value=self.data) as scan:
+                self.cache.write_text(contents)
+                self.assertEqual(usage.cached_claude_spend(), self.data)
+                scan.assert_called_once_with()
+
+    def test_unwritable_cache_still_returns_fresh_spend(self):
+        self.cache.parent.write_text("blocks directory creation")
+        with mock.patch.object(usage, "claude_spend", return_value=self.data):
+            self.assertEqual(usage.cached_claude_spend(), self.data)
+
+    def test_cli_reports_bypass_cache(self):
+        with mock.patch.object(usage, "cached_claude_spend", side_effect=AssertionError("cache used")), \
+             mock.patch.object(usage, "claude_spend", return_value=self.data) as scan, \
+             mock.patch.object(usage, "codex_rate_limits", return_value={"found": False}), \
+             mock.patch.object(usage, "claude_windows", return_value={"enabled": False}):
+            for args in ([], ["--full"], ["--json"], ["--swiftbar", "--json"]):
+                with self.subTest(args=args), contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(usage.main(args), 0)
+            self.assertEqual(scan.call_count, 4)
 
 
 class CodexRateLimitTests(unittest.TestCase):
